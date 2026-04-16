@@ -1,6 +1,11 @@
 import os
 import json
+import time
+import base64
+import mimetypes
 from contextlib import contextmanager
+import urllib.request
+import urllib.error
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -13,6 +18,7 @@ load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "showcase-images")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # required for /api/publish
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,https://showcase.x22.fr,https://showcase-omega-jade.vercel.app",
@@ -21,6 +27,38 @@ ALLOWED_ORIGINS = os.environ.get(
 
 def public_image_url(storage_key: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_key}"
+
+
+def upload_to_bucket(storage_key: str, data: bytes, content_type: str) -> None:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Bucket uploads disabled: SUPABASE_SERVICE_ROLE_KEY not set",
+        )
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_key}"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": content_type or "application/octet-stream",
+            "x-upsert": "true",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bucket upload failed ({e.code}): {body[:500]}",
+        )
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Bucket upload error: {e}")
 
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=False)
 
@@ -207,6 +245,129 @@ async def save_setup(request: Request):
             fresh_properties = cur.fetchall()
         conn.commit()
     return {"properties": fresh_properties, "view_setup": view_setup}
+
+
+@app.post("/api/publish")
+async def publish_folder(request: Request):
+    """One-way push: local folder → cloud database + bucket.
+
+    Payload shape:
+    {
+      "folder": {
+        "name": "038",
+        "note": null,
+        "sort_order": 1,
+        "properties": {"1": "Victor Hugo", "3": "1862"}  // keyed by property id
+      },
+      "images": [
+        {
+          "filename": "136-20260304_165611.jpg",
+          "caption": "Front cover",
+          "is_main": false,
+          "sort_order": 1,
+          "rotation": 0,
+          "data_base64": "...binary..."
+        }
+      ]
+    }
+
+    Creates a new folder row (re-publish creates duplicates for now — we match
+    by folder.name within the one project). Each image is uploaded under a
+    versioned storage_key: "<base>_<epoch_seconds>.<ext>".
+    """
+    payload = await request.json()
+    folder_payload = payload.get("folder") or {}
+    images_payload = payload.get("images") or []
+
+    name = (folder_payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="folder.name is required")
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from project order by id limit 1")
+            project = cur.fetchone()
+            if not project:
+                raise HTTPException(status_code=404, detail="no project")
+            project_id = project["id"]
+
+            # Find or create folder by name within project.
+            cur.execute(
+                "select id from folder where project_id = %s and name = %s",
+                (project_id, name),
+            )
+            existing = cur.fetchone()
+            if existing:
+                folder_id = existing["id"]
+                cur.execute(
+                    "update folder set note = %s, sort_order = %s, properties = %s::jsonb "
+                    "where id = %s",
+                    (
+                        folder_payload.get("note"),
+                        folder_payload.get("sort_order", 0),
+                        json.dumps(folder_payload.get("properties") or {}),
+                        folder_id,
+                    ),
+                )
+                # Drop previous folder_image links; images rows remain
+                cur.execute("delete from folder_image where folder_id = %s", (folder_id,))
+            else:
+                cur.execute(
+                    "insert into folder (project_id, name, note, sort_order, properties) "
+                    "values (%s, %s, %s, %s, %s::jsonb) returning id",
+                    (
+                        project_id,
+                        name,
+                        folder_payload.get("note"),
+                        folder_payload.get("sort_order", 0),
+                        json.dumps(folder_payload.get("properties") or {}),
+                    ),
+                )
+                folder_id = cur.fetchone()["id"]
+
+            timestamp = int(time.time())
+            uploaded = []
+            for idx, img in enumerate(images_payload):
+                filename = (img.get("filename") or "").strip()
+                if not filename:
+                    continue
+                base, _, ext = filename.rpartition(".")
+                if not base:
+                    base, ext = filename, ""
+                storage_key = f"{base}_{timestamp}.{ext}" if ext else f"{base}_{timestamp}"
+                content_type = (
+                    mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                )
+                data_b64 = img.get("data_base64") or ""
+                try:
+                    raw = base64.b64decode(data_b64, validate=False)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Could not decode image {filename}: {e}",
+                    )
+                upload_to_bucket(storage_key, raw, content_type)
+
+                cur.execute(
+                    "insert into image (storage_key, rotation) values (%s, %s) returning id",
+                    (storage_key, img.get("rotation", 0)),
+                )
+                image_id = cur.fetchone()["id"]
+                cur.execute(
+                    "insert into folder_image "
+                    "(folder_id, image_id, caption, is_main, sort_order) "
+                    "values (%s, %s, %s, %s, %s)",
+                    (
+                        folder_id,
+                        image_id,
+                        img.get("caption"),
+                        bool(img.get("is_main", False)),
+                        img.get("sort_order", idx),
+                    ),
+                )
+                uploaded.append({"filename": filename, "storage_key": storage_key})
+        conn.commit()
+    return {"folder_id": folder_id, "uploaded": uploaded}
 
 
 @app.get("/api/folders/{folder_id}/images")
