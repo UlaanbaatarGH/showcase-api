@@ -1,6 +1,7 @@
 import os
+import json
 from contextlib import contextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import psycopg
@@ -39,7 +40,7 @@ def on_shutdown():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -64,10 +65,17 @@ def hello():
 def showcase():
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select id, name from project order by id limit 1")
+            cur.execute(
+                "select id, name, view_setup from project order by id limit 1"
+            )
             project = cur.fetchone()
             if not project:
-                return {"project": None, "properties": [], "folders": []}
+                return {
+                    "project": None,
+                    "properties": [],
+                    "view_setup": {},
+                    "folders": [],
+                }
             cur.execute(
                 "select id, label, sort_order from property "
                 "where project_id = %s order by sort_order, id",
@@ -110,8 +118,95 @@ def showcase():
     return {
         "project": {"id": project["id"], "name": project["name"]},
         "properties": properties,
+        "view_setup": project["view_setup"] or {},
         "folders": folders,
     }
+
+
+@app.post("/api/setup")
+async def save_setup(request: Request):
+    payload = await request.json()
+    incoming_props = payload.get("properties", [])
+    view_setup = payload.get("view_setup", {}) or {}
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from project order by id limit 1")
+            project = cur.fetchone()
+            if not project:
+                raise HTTPException(status_code=404, detail="no project")
+            project_id = project["id"]
+
+            cur.execute(
+                "select id from property where project_id = %s",
+                (project_id,),
+            )
+            existing_ids = {r["id"] for r in cur.fetchall()}
+            incoming_existing_ids = {
+                p["id"] for p in incoming_props if isinstance(p.get("id"), int)
+            }
+            id_mapping = {}  # placeholder id → new real id
+
+            for idx, p in enumerate(incoming_props):
+                label = (p.get("label") or "").strip()
+                if not label:
+                    continue
+                sort_order = p.get("sort_order", idx)
+                if isinstance(p.get("id"), int) and p["id"] in existing_ids:
+                    cur.execute(
+                        "update property set label = %s, sort_order = %s where id = %s",
+                        (label, sort_order, p["id"]),
+                    )
+                else:
+                    cur.execute(
+                        "insert into property (project_id, label, sort_order) "
+                        "values (%s, %s, %s) returning id",
+                        (project_id, label, sort_order),
+                    )
+                    new_id = cur.fetchone()["id"]
+                    if p.get("id") is not None:
+                        id_mapping[p["id"]] = new_id
+
+            to_delete = existing_ids - incoming_existing_ids
+            for pid in to_delete:
+                cur.execute(
+                    "update folder set properties = properties - %s "
+                    "where project_id = %s",
+                    (str(pid), project_id),
+                )
+            if to_delete:
+                cur.execute(
+                    "delete from property where id = any(%s)",
+                    (list(to_delete),),
+                )
+
+            showcase_cfg = view_setup.get("showcase", {}) or {}
+            columns = showcase_cfg.get("columns", []) or []
+            filtered_columns = []
+            for col in columns:
+                if col.get("type") == "property":
+                    pid = col.get("property_id")
+                    if pid in id_mapping:
+                        pid = id_mapping[pid]
+                    if not isinstance(pid, int) or pid in to_delete:
+                        continue
+                    col = {**col, "property_id": pid}
+                filtered_columns.append(col)
+            showcase_cfg["columns"] = filtered_columns
+            view_setup["showcase"] = showcase_cfg
+
+            cur.execute(
+                "update project set view_setup = %s::jsonb where id = %s",
+                (json.dumps(view_setup), project_id),
+            )
+            cur.execute(
+                "select id, label, sort_order from property "
+                "where project_id = %s order by sort_order, id",
+                (project_id,),
+            )
+            fresh_properties = cur.fetchall()
+        conn.commit()
+    return {"properties": fresh_properties, "view_setup": view_setup}
 
 
 @app.get("/api/folders/{folder_id}/images")
