@@ -67,7 +67,13 @@ def showcase():
             cur.execute("select id, name from project order by id limit 1")
             project = cur.fetchone()
             if not project:
-                return {"project": None, "folders": []}
+                return {"project": None, "properties": [], "folders": []}
+            cur.execute(
+                "select id, label, sort_order from property "
+                "where project_id = %s order by sort_order, id",
+                (project["id"],),
+            )
+            properties = cur.fetchall()
             cur.execute(
                 """
                 select
@@ -75,6 +81,7 @@ def showcase():
                   f.name,
                   f.note,
                   f.sort_order,
+                  f.properties,
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation
                 from folder f
@@ -92,6 +99,7 @@ def showcase():
             "name": r["name"],
             "note": r["note"],
             "sort_order": r["sort_order"],
+            "properties": r["properties"] or {},
             "main_image_url": (
                 public_image_url(r["main_storage_key"]) if r["main_storage_key"] else None
             ),
@@ -99,7 +107,11 @@ def showcase():
         }
         for r in rows
     ]
-    return {"project": {"id": project["id"], "name": project["name"]}, "folders": folders}
+    return {
+        "project": {"id": project["id"], "name": project["name"]},
+        "properties": properties,
+        "folders": folders,
+    }
 
 
 @app.get("/api/folders/{folder_id}/images")
