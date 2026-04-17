@@ -4,11 +4,13 @@ import time
 import base64
 import mimetypes
 from contextlib import contextmanager
+from typing import Optional
 import urllib.request
 import urllib.error
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import jwt
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -19,6 +21,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "showcase-images")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # required for /api/publish
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")  # required for authenticated endpoints
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,https://showcase.x22.fr,https://showcase-omega-jade.vercel.app",
@@ -88,6 +91,123 @@ def health():
     return {"status": "ok"}
 
 
+# ============================================================
+# FIX310 + FIX300: auth helpers (Supabase JWT verification)
+# ============================================================
+def _decode_jwt(token: str) -> dict:
+    if not SUPABASE_JWT_SECRET:
+        raise HTTPException(status_code=503, detail="auth not configured")
+    try:
+        return jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"invalid token: {e}")
+
+
+def current_user_optional(request: Request) -> Optional[dict]:
+    """Returns {id, email} if a valid bearer token is present, None otherwise."""
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return None
+    claims = _decode_jwt(auth.split(" ", 1)[1].strip())
+    return {"id": claims.get("sub"), "email": claims.get("email")}
+
+
+def current_user_required(request: Request) -> dict:
+    user = current_user_optional(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return user
+
+
+# ============================================================
+# FIX310: users
+# ============================================================
+@app.post("/api/users/me")
+async def upsert_me(request: Request, user=Depends(current_user_required)):
+    """Create or refresh this signed-in user's app_user row.
+    Call after Supabase sign-up/sign-in so the backend knows about the user.
+    Payload: {"login_name": "chosen handle"} — only used on first insert.
+    """
+    payload = await request.json() if await request.body() else {}
+    login_name = (payload.get("login_name") or user["email"] or user["id"]).strip()
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "insert into app_user (id, login_name) values (%s, %s) "
+                "on conflict (id) do update set login_name = app_user.login_name "
+                "returning id, login_name, profile, created_at",
+                (user["id"], login_name),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row
+
+
+@app.get("/api/users/me")
+def get_me(user=Depends(current_user_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select id, login_name, profile, created_at "
+                "from app_user where id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="user row not created yet")
+    return row
+
+
+# ============================================================
+# FIX400: list projects visible to caller
+# ============================================================
+@app.get("/api/projects")
+def list_projects(user=Depends(current_user_optional)):
+    """
+    FIX400.4.1: anonymous callers see only public projects.
+    FIX400.4.2: signed-in callers also see private projects they own
+                or have any project_access row for.
+    """
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if user is None:
+                cur.execute(
+                    "select id, name, cover_image_key, is_public "
+                    "from project where is_public "
+                    "order by name, id"
+                )
+            else:
+                cur.execute(
+                    "select distinct p.id, p.name, p.cover_image_key, p.is_public "
+                    "from project p "
+                    "left join project_access pa "
+                    "       on pa.project_id = p.id and pa.user_id = %s "
+                    "where p.is_public "
+                    "   or pa.user_id is not null "
+                    "   or p.owner_id = %s "
+                    "order by p.name, p.id",
+                    (user["id"], user["id"]),
+                )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "is_public": r["is_public"],
+            "cover_image_url": (
+                public_image_url(r["cover_image_key"]) if r["cover_image_key"] else None
+            ),
+        }
+        for r in rows
+    ]
+
+
 @app.get("/api/hello")
 def hello():
     with pool.connection() as conn:
@@ -114,9 +234,15 @@ def showcase():
                     "view_setup": {},
                     "folders": [],
                 }
+            # FIX350.2.3.1: property list lives on Master Folder, not project.
+            # A project can have several Master Folders (FIX350.2.3.3); we union
+            # their properties here for the showcase view.
             cur.execute(
-                "select id, label, sort_order from property "
-                "where project_id = %s order by sort_order, id",
+                "select p.id, p.label, p.sort_order "
+                "from property p "
+                "join folder f on f.id = p.master_folder_id "
+                "where f.project_id = %s and f.is_master "
+                "order by p.sort_order, p.id",
                 (project["id"],),
             )
             properties = cur.fetchall()
@@ -175,9 +301,28 @@ async def save_setup(request: Request):
                 raise HTTPException(status_code=404, detail="no project")
             project_id = project["id"]
 
+            # FIX350.2.3.1: properties belong to a Master Folder. /api/setup
+            # currently edits a single project's list; we target the one Master
+            # Folder. If multiple Master Folders exist (FIX350.2.3.3), the
+            # endpoint needs a master_folder_id param — TODO when multi-Master
+            # editing UI lands.
             cur.execute(
-                "select id from property where project_id = %s",
+                "select id from folder "
+                "where project_id = %s and is_master "
+                "order by id limit 1",
                 (project_id,),
+            )
+            master = cur.fetchone()
+            if not master:
+                raise HTTPException(
+                    status_code=500,
+                    detail="project has no Master Folder; run migration 005",
+                )
+            master_folder_id = master["id"]
+
+            cur.execute(
+                "select id from property where master_folder_id = %s",
+                (master_folder_id,),
             )
             existing_ids = {r["id"] for r in cur.fetchall()}
             incoming_existing_ids = {
@@ -197,9 +342,9 @@ async def save_setup(request: Request):
                     )
                 else:
                     cur.execute(
-                        "insert into property (project_id, label, sort_order) "
+                        "insert into property (master_folder_id, label, sort_order) "
                         "values (%s, %s, %s) returning id",
-                        (project_id, label, sort_order),
+                        (master_folder_id, label, sort_order),
                     )
                     new_id = cur.fetchone()["id"]
                     if p.get("id") is not None:
@@ -239,8 +384,8 @@ async def save_setup(request: Request):
             )
             cur.execute(
                 "select id, label, sort_order from property "
-                "where project_id = %s order by sort_order, id",
-                (project_id,),
+                "where master_folder_id = %s order by sort_order, id",
+                (master_folder_id,),
             )
             fresh_properties = cur.fetchall()
         conn.commit()
