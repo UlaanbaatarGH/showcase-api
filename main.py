@@ -63,7 +63,18 @@ def upload_to_bucket(storage_key: str, data: bytes, content_type: str) -> None:
     except urllib.error.URLError as e:
         raise HTTPException(status_code=502, detail=f"Bucket upload error: {e}")
 
-pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=False)
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    open=False,
+    # Supabase's pooler (port 6543) runs pgBouncer in transaction mode. Server
+    # connections are reused between clients, which breaks server-side
+    # prepared statements — psycopg3 caches statement names per client conn
+    # but the server-side slot can already be taken. Disable auto-preparation
+    # by passing prepare_threshold=None to every Connection.connect().
+    kwargs={"prepare_threshold": None},
+)
 
 app = FastAPI()
 
