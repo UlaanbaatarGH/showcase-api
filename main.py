@@ -688,6 +688,151 @@ async def publish_folder(request: Request):
     return {"folder_id": folder_id, "uploaded": uploaded}
 
 
+# ============================================================
+# FIX371: image import from disk — existing images listing + signed upload
+# ============================================================
+@app.get("/api/projects/{project_id}/existing-images")
+def existing_images(project_id: int, user=Depends(current_user_required)):
+    """Return all folder_image rows under a project, grouped by item name.
+    The import-images client uses this to classify each disk file as
+    new / updated / ignored against what is already linked.
+    """
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                select f.name as folder_name, fi.id as folder_image_id,
+                       fi.image_id, img.storage_key
+                  from folder f
+                  join folder_image fi on fi.folder_id = f.id
+                  join image img on img.id = fi.image_id
+                 where f.project_id = %s
+                """,
+                (project_id,),
+            )
+            rows = cur.fetchall()
+    by_item = {}
+    for r in rows:
+        by_item.setdefault(r["folder_name"], []).append({
+            "folder_image_id": r["folder_image_id"],
+            "image_id": r["image_id"],
+            "storage_key": r["storage_key"],
+        })
+    return {"items": by_item}
+
+
+def _sanitize_path_segment(s: str) -> str:
+    # Keep ASCII letters/digits/_/-/. — replace the rest with '_' so the
+    # bucket path stays valid across all storage backends.
+    import re as _re
+    return _re.sub(r"[^a-zA-Z0-9._-]", "_", s or "")
+
+
+@app.post("/api/images/sign-upload")
+async def sign_upload(request: Request, user=Depends(current_user_required)):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="bucket uploads not configured")
+    payload = await request.json()
+    project_id = payload.get("project_id")
+    item_name = payload.get("item_name") or ""
+    filename = payload.get("filename") or ""
+    if not project_id or not item_name or not filename:
+        raise HTTPException(status_code=400, detail="project_id, item_name, filename required")
+    storage_key = (
+        f"p{int(project_id)}/"
+        f"{_sanitize_path_segment(item_name)}/"
+        f"{_sanitize_path_segment(filename)}"
+    )
+    url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/json",
+        },
+        data=b"{}",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sign upload failed ({e.code}): {body[:300]}",
+        )
+    signed_path = result.get("url") or ""
+    signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+    return {"storage_key": storage_key, "signed_url": signed_url}
+
+
+@app.post("/api/images/confirm")
+async def confirm_image(request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    project_id = payload.get("project_id")
+    item_name = (payload.get("item_name") or "").strip()
+    storage_key = payload.get("storage_key")
+    sort_order = payload.get("sort_order", 0)
+    caption = payload.get("caption")
+    replaces_image_id = payload.get("replaces_image_id")
+    if not project_id or not item_name or not storage_key:
+        raise HTTPException(status_code=400, detail="project_id, item_name, storage_key required")
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select id from folder where project_id = %s and name = %s",
+                (project_id, item_name),
+            )
+            row = cur.fetchone()
+            if row:
+                folder_id = row["id"]
+            else:
+                # FIX371.6.1: auto-create the item if the id isn't known.
+                cur.execute(
+                    "select id from folder where project_id = %s and is_master order by id limit 1",
+                    (project_id,),
+                )
+                master = cur.fetchone()
+                if not master:
+                    raise HTTPException(status_code=500, detail="project has no Master Folder")
+                cur.execute(
+                    "select coalesce(max(sort_order), -1) as m from folder "
+                    "where project_id = %s and parent_id = %s",
+                    (project_id, master["id"]),
+                )
+                next_fsort = (cur.fetchone()["m"] or -1) + 1
+                cur.execute(
+                    "insert into folder (project_id, parent_id, name, sort_order) "
+                    "values (%s, %s, %s, %s) returning id",
+                    (project_id, master["id"], item_name, next_fsort),
+                )
+                folder_id = cur.fetchone()["id"]
+
+            cur.execute(
+                "insert into image (storage_key) values (%s) returning id",
+                (storage_key,),
+            )
+            image_id = cur.fetchone()["id"]
+
+            if replaces_image_id:
+                cur.execute(
+                    "update folder_image set image_id = %s "
+                    "where folder_id = %s and image_id = %s",
+                    (image_id, folder_id, replaces_image_id),
+                )
+            else:
+                cur.execute(
+                    "insert into folder_image (folder_id, image_id, sort_order, caption) "
+                    "values (%s, %s, %s, %s)",
+                    (folder_id, image_id, sort_order, caption),
+                )
+        conn.commit()
+    return {"image_id": image_id, "folder_id": folder_id}
+
+
 @app.get("/api/folders/{folder_id}/images")
 def list_folder_images(folder_id: int):
     with pool.connection() as conn:
