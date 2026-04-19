@@ -299,6 +299,17 @@ def showcase():
 @app.post("/api/setup")
 async def save_setup(request: Request):
     payload = await request.json()
+    try:
+        return _save_setup_impl(payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("save_setup failed:\n" + tb, flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+def _save_setup_impl(payload):
     incoming_props = payload.get("properties", [])
     view_setup = payload.get("view_setup", {}) or {}
 
