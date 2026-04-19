@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import traceback
 import mimetypes
 from contextlib import contextmanager
 from typing import Optional
@@ -429,6 +430,19 @@ async def import_gsheet(
     new_folders = payload.get("new_folders") or []
     updates = payload.get("updates") or []
 
+    try:
+        return _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface the actual error to the frontend instead of a bare 500 so
+        # the import dialog can show something actionable.
+        tb = traceback.format_exc()
+        print("import-gsheet failed:\n" + tb, flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select id from project where id = %s", (project_id,))
