@@ -400,6 +400,135 @@ async def save_setup(request: Request):
     return {"properties": fresh_properties, "view_setup": view_setup}
 
 
+# ============================================================
+# FIX370: Google Sheet import — one transactional endpoint
+# ============================================================
+@app.post("/api/projects/{project_id}/import-gsheet")
+async def import_gsheet(
+    project_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    """Bulk apply a validated gsheet import plan.
+
+    Payload:
+    {
+      "new_properties": ["Writer", "Genre"],
+      "renames": [{"id": 5, "label": "Writer"}],
+      "new_folders": ["F001", "F002"],
+      "updates": [
+        {"folder_name": "F001", "property_label": "Writer", "value": "Hugo"}
+      ]
+    }
+    No deletion: rows removed from the sheet never delete folders or
+    properties. All folders go under the project's (single) Master Folder.
+    """
+    payload = await request.json()
+    new_properties = payload.get("new_properties") or []
+    renames = payload.get("renames") or []
+    new_folders = payload.get("new_folders") or []
+    updates = payload.get("updates") or []
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from project where id = %s", (project_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="project not found")
+
+            cur.execute(
+                "select id from folder "
+                "where project_id = %s and is_master "
+                "order by id limit 1",
+                (project_id,),
+            )
+            master = cur.fetchone()
+            if not master:
+                raise HTTPException(
+                    status_code=500,
+                    detail="project has no Master Folder",
+                )
+            master_folder_id = master["id"]
+
+            # 1) new properties
+            cur.execute(
+                "select coalesce(max(sort_order), -1) as m from property "
+                "where master_folder_id = %s",
+                (master_folder_id,),
+            )
+            next_sort = (cur.fetchone()["m"] or -1) + 1
+            new_prop_ids = {}
+            for label in new_properties:
+                cur.execute(
+                    "insert into property (master_folder_id, label, sort_order) "
+                    "values (%s, %s, %s) returning id",
+                    (master_folder_id, label, next_sort),
+                )
+                new_prop_ids[label] = cur.fetchone()["id"]
+                next_sort += 1
+
+            # 2) renames
+            for r in renames:
+                cur.execute(
+                    "update property set label = %s "
+                    "where id = %s and master_folder_id = %s",
+                    (r["label"], r["id"], master_folder_id),
+                )
+
+            # 3) new folders (as children of the master folder)
+            cur.execute(
+                "select coalesce(max(sort_order), -1) as m from folder "
+                "where project_id = %s and parent_id = %s",
+                (project_id, master_folder_id),
+            )
+            next_fsort = (cur.fetchone()["m"] or -1) + 1
+            new_folder_ids = {}
+            for fname in new_folders:
+                cur.execute(
+                    "insert into folder (project_id, parent_id, name, sort_order) "
+                    "values (%s, %s, %s, %s) returning id",
+                    (project_id, master_folder_id, fname, next_fsort),
+                )
+                new_folder_ids[fname] = cur.fetchone()["id"]
+                next_fsort += 1
+
+            # 4) lookup tables for updates
+            cur.execute(
+                "select id, label from property where master_folder_id = %s",
+                (master_folder_id,),
+            )
+            label_to_prop = {r["label"]: r["id"] for r in cur.fetchall()}
+            cur.execute(
+                "select id, name from folder where project_id = %s",
+                (project_id,),
+            )
+            name_to_folder = {r["name"]: r["id"] for r in cur.fetchall()}
+
+            # 5) aggregate and merge updates into folder.properties JSONB
+            per_folder = {}
+            for u in updates:
+                fid = name_to_folder.get(u.get("folder_name"))
+                pid = label_to_prop.get(u.get("property_label"))
+                if fid is None or pid is None:
+                    continue
+                per_folder.setdefault(fid, {})[str(pid)] = u.get("value", "") or ""
+
+            for fid, merge_map in per_folder.items():
+                cur.execute(
+                    "update folder set "
+                    "properties = coalesce(properties, '{}'::jsonb) || %s::jsonb "
+                    "where id = %s",
+                    (json.dumps(merge_map), fid),
+                )
+
+        conn.commit()
+    return {
+        "new_properties_count": len(new_prop_ids),
+        "renames_count": len(renames),
+        "new_folders_count": len(new_folder_ids),
+        "updated_folders_count": len(per_folder),
+    }
+
+
 @app.post("/api/publish")
 async def publish_folder(request: Request):
     """One-way push: local folder → cloud database + bucket.
