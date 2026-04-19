@@ -10,7 +10,6 @@ import urllib.error
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import jwt
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -21,7 +20,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "showcase-images")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # required for /api/publish
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")  # required for authenticated endpoints
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # required for authenticated endpoints
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,https://showcase.x22.fr,https://showcase-omega-jade.vercel.app",
@@ -94,18 +93,27 @@ def health():
 # ============================================================
 # FIX310 + FIX300: auth helpers (Supabase JWT verification)
 # ============================================================
-def _decode_jwt(token: str) -> dict:
-    if not SUPABASE_JWT_SECRET:
+def _verify_token(token: str) -> dict:
+    # Validate the access token by asking Supabase directly. This works
+    # regardless of the project's signing algorithm (HS256 legacy, ES256 new
+    # asymmetric keys) and avoids having to manage a shared JWT secret.
+    if not SUPABASE_ANON_KEY:
         raise HTTPException(status_code=503, detail="auth not configured")
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "apikey": SUPABASE_ANON_KEY,
+        },
+    )
     try:
-        return jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-    except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"invalid token: {e}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=401, detail=f"invalid token ({e.code}): {body[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"auth verify error: {e}")
 
 
 def current_user_optional(request: Request) -> Optional[dict]:
@@ -113,8 +121,8 @@ def current_user_optional(request: Request) -> Optional[dict]:
     auth = request.headers.get("authorization") or ""
     if not auth.lower().startswith("bearer "):
         return None
-    claims = _decode_jwt(auth.split(" ", 1)[1].strip())
-    return {"id": claims.get("sub"), "email": claims.get("email")}
+    user = _verify_token(auth.split(" ", 1)[1].strip())
+    return {"id": user.get("id"), "email": user.get("email")}
 
 
 def current_user_required(request: Request) -> dict:
