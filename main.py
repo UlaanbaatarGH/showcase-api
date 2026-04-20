@@ -363,29 +363,39 @@ def _save_setup_impl(payload):
             }
             id_mapping = {}  # placeholder id → new real id
 
+            def _clean_optional(raw):
+                return (
+                    raw.strip() if isinstance(raw, str) and raw.strip() else None
+                )
+
             for idx, p in enumerate(incoming_props):
                 label = (p.get("label") or "").strip()
                 if not label:
                     continue
                 sort_order = p.get("sort_order", idx)
-                # FIX500.2.2.2.1.1.3 / <property-short-name>: optional short
-                # label used as the Showcase list column header (FIX510.2.1.1.2).
-                # Empty string → null so the UI falls back to `label`.
-                raw_short = p.get("short_label")
-                short_label = (
-                    raw_short.strip() if isinstance(raw_short, str) and raw_short.strip() else None
-                )
-                # FIX500.2.2.5.3.2: optional formula; when present the property
-                # is computed from another property's value at display time.
-                raw_formula = p.get("formula")
-                formula = (
-                    raw_formula.strip() if isinstance(raw_formula, str) and raw_formula.strip() else None
-                )
+                # Optional fields (FIX500.2.2.2.1.1.3 / FIX500.2.2.5.3.2):
+                # presence check — if the caller didn't include the key we
+                # leave the existing DB value alone. This matters because
+                # panels that aren't the property editor (GroupingPanel,
+                # grouping defaults, etc.) call /api/setup with only a slim
+                # properties payload and previously wiped these fields.
+                has_short = "short_label" in p
+                has_formula = "formula" in p
+                short_label = _clean_optional(p.get("short_label")) if has_short else None
+                formula = _clean_optional(p.get("formula")) if has_formula else None
                 if isinstance(p.get("id"), int) and p["id"] in existing_ids:
+                    set_parts = ["label = %s", "sort_order = %s"]
+                    params = [label, sort_order]
+                    if has_short:
+                        set_parts.append("short_label = %s")
+                        params.append(short_label)
+                    if has_formula:
+                        set_parts.append("formula = %s")
+                        params.append(formula)
+                    params.append(p["id"])
                     cur.execute(
-                        "update property set label = %s, short_label = %s, "
-                        "formula = %s, sort_order = %s where id = %s",
-                        (label, short_label, formula, sort_order, p["id"]),
+                        f"update property set {', '.join(set_parts)} where id = %s",
+                        params,
                     )
                 else:
                     cur.execute(
