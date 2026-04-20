@@ -258,7 +258,7 @@ def showcase():
             # A project can have several Master Folders (FIX350.2.3.3); we union
             # their properties here for the showcase view.
             cur.execute(
-                "select p.id, p.label, p.sort_order "
+                "select p.id, p.label, p.short_label, p.sort_order "
                 "from property p "
                 "join folder f on f.id = p.master_folder_id "
                 "where f.project_id = %s and f.is_master "
@@ -368,16 +368,24 @@ def _save_setup_impl(payload):
                 if not label:
                     continue
                 sort_order = p.get("sort_order", idx)
+                # FIX500.2.2.2.1.1.3 / <property-short-name>: optional short
+                # label used as the Showcase list column header (FIX510.2.1.1.2).
+                # Empty string → null so the UI falls back to `label`.
+                raw_short = p.get("short_label")
+                short_label = (
+                    raw_short.strip() if isinstance(raw_short, str) and raw_short.strip() else None
+                )
                 if isinstance(p.get("id"), int) and p["id"] in existing_ids:
                     cur.execute(
-                        "update property set label = %s, sort_order = %s where id = %s",
-                        (label, sort_order, p["id"]),
+                        "update property set label = %s, short_label = %s, sort_order = %s "
+                        "where id = %s",
+                        (label, short_label, sort_order, p["id"]),
                     )
                 else:
                     cur.execute(
-                        "insert into property (master_folder_id, label, sort_order) "
-                        "values (%s, %s, %s) returning id",
-                        (master_folder_id, label, sort_order),
+                        "insert into property (master_folder_id, label, short_label, sort_order) "
+                        "values (%s, %s, %s, %s) returning id",
+                        (master_folder_id, label, short_label, sort_order),
                     )
                     new_id = cur.fetchone()["id"]
                     if p.get("id") is not None:
@@ -416,7 +424,7 @@ def _save_setup_impl(payload):
                 (json.dumps(view_setup), project_id),
             )
             cur.execute(
-                "select id, label, sort_order from property "
+                "select id, label, short_label, sort_order from property "
                 "where master_folder_id = %s order by sort_order, id",
                 (master_folder_id,),
             )
@@ -495,11 +503,28 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates
             )
             next_sort = (cur.fetchone()["m"] or -1) + 1
             new_prop_ids = {}
-            for label in new_properties:
+            # FIX370.1.2.1.3 / <property-short-name>: each new property may
+            # carry a `short_label` alongside its `label`. Accept both the
+            # new object shape [{label, short_label}] and the legacy string
+            # shape so older callers still work.
+            for entry in new_properties:
+                if isinstance(entry, dict):
+                    label = (entry.get("label") or "").strip()
+                    raw_short = entry.get("short_label")
+                    short_label = (
+                        raw_short.strip()
+                        if isinstance(raw_short, str) and raw_short.strip()
+                        else None
+                    )
+                else:
+                    label = (entry or "").strip()
+                    short_label = None
+                if not label:
+                    continue
                 cur.execute(
-                    "insert into property (master_folder_id, label, sort_order) "
-                    "values (%s, %s, %s) returning id",
-                    (master_folder_id, label, next_sort),
+                    "insert into property (master_folder_id, label, short_label, sort_order) "
+                    "values (%s, %s, %s, %s) returning id",
+                    (master_folder_id, label, short_label, next_sort),
                 )
                 new_prop_ids[label] = cur.fetchone()["id"]
                 next_sort += 1
