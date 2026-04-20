@@ -275,7 +275,8 @@ def showcase():
                   f.sort_order,
                   f.properties,
                   img.storage_key as main_storage_key,
-                  img.rotation    as main_rotation
+                  img.rotation    as main_rotation,
+                  exists (select 1 from folder_image where folder_id = f.id) as has_image
                 from folder f
                 left join folder_image fi on fi.folder_id = f.id and fi.is_main
                 left join image img       on img.id = fi.image_id
@@ -296,6 +297,7 @@ def showcase():
                 public_image_url(r["main_storage_key"]) if r["main_storage_key"] else None
             ),
             "main_rotation": r["main_rotation"],
+            "has_image": bool(r["has_image"]),
         }
         for r in rows
     ]
