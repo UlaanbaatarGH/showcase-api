@@ -258,7 +258,7 @@ def showcase():
             # A project can have several Master Folders (FIX350.2.3.3); we union
             # their properties here for the showcase view.
             cur.execute(
-                "select p.id, p.label, p.short_label, p.sort_order "
+                "select p.id, p.label, p.short_label, p.formula, p.sort_order "
                 "from property p "
                 "join folder f on f.id = p.master_folder_id "
                 "where f.project_id = %s and f.is_master "
@@ -375,17 +375,23 @@ def _save_setup_impl(payload):
                 short_label = (
                     raw_short.strip() if isinstance(raw_short, str) and raw_short.strip() else None
                 )
+                # FIX500.2.2.5.3.2: optional formula; when present the property
+                # is computed from another property's value at display time.
+                raw_formula = p.get("formula")
+                formula = (
+                    raw_formula.strip() if isinstance(raw_formula, str) and raw_formula.strip() else None
+                )
                 if isinstance(p.get("id"), int) and p["id"] in existing_ids:
                     cur.execute(
-                        "update property set label = %s, short_label = %s, sort_order = %s "
-                        "where id = %s",
-                        (label, short_label, sort_order, p["id"]),
+                        "update property set label = %s, short_label = %s, "
+                        "formula = %s, sort_order = %s where id = %s",
+                        (label, short_label, formula, sort_order, p["id"]),
                     )
                 else:
                     cur.execute(
-                        "insert into property (master_folder_id, label, short_label, sort_order) "
-                        "values (%s, %s, %s, %s) returning id",
-                        (master_folder_id, label, short_label, sort_order),
+                        "insert into property (master_folder_id, label, short_label, formula, sort_order) "
+                        "values (%s, %s, %s, %s, %s) returning id",
+                        (master_folder_id, label, short_label, formula, sort_order),
                     )
                     new_id = cur.fetchone()["id"]
                     if p.get("id") is not None:
@@ -424,7 +430,7 @@ def _save_setup_impl(payload):
                 (json.dumps(view_setup), project_id),
             )
             cur.execute(
-                "select id, label, short_label, sort_order from property "
+                "select id, label, short_label, formula, sort_order from property "
                 "where master_folder_id = %s order by sort_order, id",
                 (master_folder_id,),
             )
