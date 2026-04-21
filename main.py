@@ -890,8 +890,10 @@ def list_folder_images(folder_id: int):
                   fi.caption,
                   fi.is_main,
                   fi.sort_order,
+                  img.id          as image_id,
                   img.storage_key,
-                  img.rotation
+                  img.rotation,
+                  img.crop
                 from folder_image fi
                 join image img on img.id = fi.image_id
                 where fi.folder_id = %s
@@ -903,11 +905,71 @@ def list_folder_images(folder_id: int):
     return [
         {
             "id": r["id"],
+            "image_id": r["image_id"],
             "caption": r["caption"],
             "is_main": r["is_main"],
             "sort_order": r["sort_order"],
             "url": public_image_url(r["storage_key"]),
             "rotation": r["rotation"],
+            "crop": r["crop"],
         }
         for r in rows
     ]
+
+
+# FIX520.2.10 (Showcase image viewer toolbox) non-destructive save: update
+# crop rectangle and/or rotation on the Image row. The physical asset in
+# the bucket is never touched — the viewer composes the final pixels at
+# render time from storage_key + rotation + crop.
+@app.patch("/api/images/{image_id}")
+async def update_image(
+    image_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    payload = await request.json()
+    updates: list[str] = []
+    params: list = []
+
+    if "rotation" in payload:
+        rot = payload.get("rotation")
+        if rot is not None and not isinstance(rot, (int, float)):
+            raise HTTPException(status_code=400, detail="rotation must be a number")
+        updates.append("rotation = %s")
+        # Normalise to [0, 360) so downstream renders get a consistent value.
+        params.append(int(rot) % 360 if rot is not None else 0)
+
+    if "crop" in payload:
+        crop = payload.get("crop")
+        if crop is not None:
+            if not isinstance(crop, dict):
+                raise HTTPException(status_code=400, detail="crop must be an object or null")
+            for k in ("x", "y", "width", "height"):
+                if k not in crop or not isinstance(crop[k], (int, float)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"crop.{k} (number) is required when crop is provided",
+                    )
+        updates.append("crop = %s::jsonb")
+        params.append(json.dumps(crop) if crop is not None else None)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="nothing to update")
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from image where id = %s", (image_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="image not found")
+            cur.execute(
+                f"update image set {', '.join(updates)} where id = %s "
+                "returning id, rotation, crop",
+                (*params, image_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return {
+        "id": row["id"],
+        "rotation": row["rotation"],
+        "crop": row["crop"],
+    }
