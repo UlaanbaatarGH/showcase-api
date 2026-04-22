@@ -888,6 +888,7 @@ def list_folder_images(folder_id: int):
                 select
                   fi.id,
                   fi.caption,
+                  fi.section,
                   fi.is_main,
                   fi.sort_order,
                   img.id          as image_id,
@@ -907,14 +908,77 @@ def list_folder_images(folder_id: int):
             "id": r["id"],
             "image_id": r["image_id"],
             "caption": r["caption"],
+            "section": r["section"],
             "is_main": r["is_main"],
             "sort_order": r["sort_order"],
+            # FIX521.2.1.1.1: "File name" column. storage_key is
+            # "pN/<item>/<filename>"; the basename is what the user
+            # originally uploaded (with the versioning suffix appended).
+            "filename": r["storage_key"].rsplit("/", 1)[-1],
             "url": public_image_url(r["storage_key"]),
             "rotation": r["rotation"],
             "crop": r["crop"],
         }
         for r in rows
     ]
+
+
+# FIX521.2.1.1.3 / .1.1.4 / .3.1 / .3.2: caption, section and sort_order
+# live on folder_image (per-association), so edits from the Image List
+# editor go here rather than /api/images. Accepts any subset of
+# {caption, section, sort_order}; omitted keys are left untouched.
+@app.patch("/api/folder-images/{folder_image_id}")
+async def update_folder_image(
+    folder_image_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    payload = await request.json()
+    updates: list[str] = []
+    params: list = []
+
+    if "caption" in payload:
+        caption = payload.get("caption")
+        if caption is not None and not isinstance(caption, str):
+            raise HTTPException(status_code=400, detail="caption must be a string or null")
+        updates.append("caption = %s")
+        params.append(caption)
+
+    if "section" in payload:
+        section = payload.get("section")
+        if section is not None and not isinstance(section, str):
+            raise HTTPException(status_code=400, detail="section must be a string or null")
+        updates.append("section = %s")
+        params.append(section)
+
+    if "sort_order" in payload:
+        sort_order = payload.get("sort_order")
+        if not isinstance(sort_order, (int, float)):
+            raise HTTPException(status_code=400, detail="sort_order must be a number")
+        updates.append("sort_order = %s")
+        params.append(int(sort_order))
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="nothing to update")
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from folder_image where id = %s", (folder_image_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="folder_image not found")
+            cur.execute(
+                f"update folder_image set {', '.join(updates)} where id = %s "
+                "returning id, caption, section, sort_order",
+                (*params, folder_image_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return {
+        "id": row["id"],
+        "caption": row["caption"],
+        "section": row["section"],
+        "sort_order": row["sort_order"],
+    }
 
 
 # FIX520.2.10 (Showcase image viewer toolbox) non-destructive save: update
