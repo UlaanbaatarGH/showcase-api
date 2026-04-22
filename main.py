@@ -198,13 +198,19 @@ def list_projects(user=Depends(current_user_optional)):
         with conn.cursor(row_factory=dict_row) as cur:
             if user is None:
                 cur.execute(
-                    "select id, name, cover_image_key, is_public "
+                    "select id, name, cover_image_key, is_public, "
+                    "       false as can_edit "
                     "from project where is_public "
                     "order by name, id"
                 )
             else:
+                # FIX400.3.2.1 / FIX400.4.3: can_edit flags projects the
+                # signed-in user is allowed to rename / re-cover. Owner-only
+                # for now — group2/group3 rights cover *item* content, not
+                # project metadata.
                 cur.execute(
-                    "select distinct p.id, p.name, p.cover_image_key, p.is_public "
+                    "select distinct p.id, p.name, p.cover_image_key, p.is_public, "
+                    "       (p.owner_id = %s) as can_edit "
                     "from project p "
                     "left join project_access pa "
                     "       on pa.project_id = p.id and pa.user_id = %s "
@@ -212,7 +218,7 @@ def list_projects(user=Depends(current_user_optional)):
                     "   or pa.user_id is not null "
                     "   or p.owner_id = %s "
                     "order by p.name, p.id",
-                    (user["id"], user["id"]),
+                    (user["id"], user["id"], user["id"]),
                 )
             rows = cur.fetchall()
     return [
@@ -220,12 +226,127 @@ def list_projects(user=Depends(current_user_optional)):
             "id": r["id"],
             "name": r["name"],
             "is_public": r["is_public"],
+            "can_edit": bool(r["can_edit"]),
             "cover_image_url": (
                 public_image_url(r["cover_image_key"]) if r["cover_image_key"] else None
             ),
         }
         for r in rows
     ]
+
+
+# FIX400.3.3 + FIX400.3.2.1.1: rename a project and/or replace its cover
+# image. Owner-only. Payload accepts any subset of {name, cover_image_key}.
+@app.patch("/api/projects/{project_id}")
+async def update_project(
+    project_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    payload = await request.json()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select owner_id from project where id = %s", (project_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="project not found")
+            if row["owner_id"] != user["id"]:
+                raise HTTPException(status_code=403, detail="not owner")
+
+            updates: list[str] = []
+            params: list = []
+            if "name" in payload:
+                name = payload.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise HTTPException(status_code=400, detail="name must be a non-empty string")
+                updates.append("name = %s")
+                params.append(name.strip())
+            if "cover_image_key" in payload:
+                cover = payload.get("cover_image_key")
+                if cover is not None and not isinstance(cover, str):
+                    raise HTTPException(status_code=400, detail="cover_image_key must be string or null")
+                updates.append("cover_image_key = %s")
+                params.append(cover)
+            if not updates:
+                raise HTTPException(status_code=400, detail="nothing to update")
+
+            cur.execute(
+                f"update project set {', '.join(updates)} where id = %s "
+                "returning id, name, cover_image_key, is_public",
+                (*params, project_id),
+            )
+            r = cur.fetchone()
+        conn.commit()
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "is_public": r["is_public"],
+        "cover_image_url": (
+            public_image_url(r["cover_image_key"]) if r["cover_image_key"] else None
+        ),
+    }
+
+
+# FIX400.3.2.1.2: request a signed upload URL for a new project cover
+# image. The client PUTs the bytes directly to Supabase, then calls
+# PATCH /api/projects/:id with the returned storage_key.
+@app.post("/api/projects/{project_id}/sign-cover-upload")
+async def sign_project_cover_upload(
+    project_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    payload = await request.json()
+    filename = payload.get("filename") or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename required")
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select owner_id from project where id = %s", (project_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="project not found")
+            if row["owner_id"] != user["id"]:
+                raise HTTPException(status_code=403, detail="not owner")
+
+    # Versioned key so browser caches of the public URL are invalidated
+    # when the cover is replaced. Matches the convention used for content
+    # images (see /api/images/confirm).
+    timestamp = int(time.time())
+    base, _, ext = _sanitize_path_segment(filename).rpartition(".")
+    if not base:
+        base, ext = _sanitize_path_segment(filename), ""
+    storage_key = (
+        f"p{int(project_id)}/_cover/{base}_{timestamp}.{ext}"
+        if ext else f"p{int(project_id)}/_cover/{base}_{timestamp}"
+    )
+    url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/json",
+        },
+        data=b"{}",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Supabase sign failed: {body[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase sign failed: {e}")
+    signed_path = result.get("url") or ""
+    signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+    return {"storage_key": storage_key, "signed_url": signed_url}
 
 
 @app.get("/api/hello")
