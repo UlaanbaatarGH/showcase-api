@@ -205,12 +205,13 @@ def list_projects(user=Depends(current_user_optional)):
                 )
             else:
                 # FIX400.3.2.1 / FIX400.4.3: can_edit flags projects the
-                # signed-in user is allowed to rename / re-cover. Owner-only
-                # for now — group2/group3 rights cover *item* content, not
-                # project metadata.
+                # signed-in user is allowed to rename / re-cover. True when
+                # the user is the owner OR the project is unowned
+                # (owner_id IS NULL) — the first successful edit auto-claims
+                # ownership in PATCH /api/projects/:id below.
                 cur.execute(
                     "select distinct p.id, p.name, p.cover_image_key, p.is_public, "
-                    "       (p.owner_id = %s) as can_edit "
+                    "       (p.owner_id = %s or p.owner_id is null) as can_edit "
                     "from project p "
                     "left join project_access pa "
                     "       on pa.project_id = p.id and pa.user_id = %s "
@@ -252,8 +253,12 @@ async def update_project(
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="project not found")
-            if row["owner_id"] != user["id"]:
+            # Allow: owner, or anyone if the project is still unowned — in
+            # which case we auto-claim ownership below so subsequent edits
+            # stick to this user.
+            if row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
+            auto_claim = row["owner_id"] is None
 
             updates: list[str] = []
             params: list = []
@@ -269,6 +274,9 @@ async def update_project(
                     raise HTTPException(status_code=400, detail="cover_image_key must be string or null")
                 updates.append("cover_image_key = %s")
                 params.append(cover)
+            if auto_claim:
+                updates.append("owner_id = %s")
+                params.append(user["id"])
             if not updates:
                 raise HTTPException(status_code=400, detail="nothing to update")
 
@@ -311,7 +319,10 @@ async def sign_project_cover_upload(
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="project not found")
-            if row["owner_id"] != user["id"]:
+            # Same relaxed owner check as PATCH — unowned projects can be
+            # edited by any signed-in user. The PATCH that follows will
+            # auto-claim ownership on save.
+            if row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
 
     # Versioned key so browser caches of the public URL are invalidated
