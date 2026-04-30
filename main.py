@@ -975,6 +975,43 @@ def _sanitize_path_segment(s: str) -> str:
     return _re.sub(r"[^a-zA-Z0-9._-]", "_", s or "")
 
 
+def _bucket_delete(storage_key: str) -> None:
+    """Delete a single object from the bucket. 404 is treated as success
+    (already gone). Raises HTTPException on any other failure."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="bucket access not configured")
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_key}"
+    req = urllib.request.Request(
+        url,
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bucket delete failed ({e.code}): {body[:200]}",
+        )
+
+
+def _has_image_row(storage_key: str) -> bool:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select 1 from image where storage_key = %s limit 1",
+                (storage_key,),
+            )
+            return cur.fetchone() is not None
+
+
 @app.post("/api/images/sign-upload")
 async def sign_upload(request: Request, user=Depends(current_user_required)):
     if not SUPABASE_SERVICE_ROLE_KEY:
@@ -990,29 +1027,72 @@ async def sign_upload(request: Request, user=Depends(current_user_required)):
         f"{_sanitize_path_segment(item_name)}/"
         f"{_sanitize_path_segment(filename)}"
     )
-    url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
-    req = urllib.request.Request(
-        url,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Content-Type": "application/json",
-        },
-        data=b"{}",
-    )
-    try:
+
+    def _request_signed_upload():
+        url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
+        req = urllib.request.Request(
+            url,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Content-Type": "application/json",
+            },
+            data=b"{}",
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
+            return json.loads(resp.read())
+
+    try:
+        result = _request_signed_upload()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Sign upload failed ({e.code}): {body[:300]}",
-        )
+        # FIX371 orphan recovery: when the bucket says the object already
+        # exists but no image row references it, the file is an orphan
+        # from a previous failed upload (e.g. PUT succeeded but confirm
+        # never ran). Delete the orphan and retry the sign once. If a
+        # row DOES exist, the key is in legitimate use — surface the
+        # error so the caller doesn't overwrite live data.
+        is_dup = '"statusCode":"409"' in body or '"Duplicate"' in body
+        if is_dup and not _has_image_row(storage_key):
+            _bucket_delete(storage_key)
+            try:
+                result = _request_signed_upload()
+            except urllib.error.HTTPError as e2:
+                body2 = e2.read().decode("utf-8", errors="replace")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Sign upload failed after orphan cleanup ({e2.code}): {body2[:200]}",
+                )
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Sign upload failed ({e.code}): {body[:300]}",
+            )
     signed_path = result.get("url") or ""
     signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
     return {"storage_key": storage_key, "signed_url": signed_url}
+
+
+@app.post("/api/images/delete-orphan")
+async def delete_orphan_image(request: Request, user=Depends(current_user_required)):
+    """FIX371 cleanup: delete a bucket object that the client believes
+    is an orphan (e.g. its confirm-image call failed mid-upload). Refuses
+    to delete keys referenced by any image DB row, and only allows keys
+    under p{project_id}/ as a basic ownership safeguard.
+    """
+    payload = await request.json()
+    project_id = payload.get("project_id")
+    storage_key = payload.get("storage_key")
+    if not project_id or not storage_key:
+        raise HTTPException(status_code=400, detail="project_id and storage_key required")
+    expected_prefix = f"p{int(project_id)}/"
+    if not str(storage_key).startswith(expected_prefix):
+        raise HTTPException(status_code=400, detail="storage_key does not match project_id")
+    if _has_image_row(storage_key):
+        raise HTTPException(status_code=409, detail="storage_key is referenced by a DB row")
+    _bucket_delete(storage_key)
+    return {"deleted": True}
 
 
 @app.post("/api/images/confirm")
