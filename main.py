@@ -390,7 +390,8 @@ def showcase():
             # A project can have several Master Folders (FIX350.2.3.3); we union
             # their properties here for the showcase view.
             cur.execute(
-                "select p.id, p.label, p.short_label, p.formula, p.sort_order "
+                "select p.id, p.label, p.short_label, p.formula, "
+                "       p.trailing_values, p.accepted_value_set, p.sort_order "
                 "from property p "
                 "join folder f on f.id = p.master_folder_id "
                 "where f.project_id = %s and f.is_master "
@@ -513,8 +514,18 @@ def _save_setup_impl(payload):
                 # properties payload and previously wiped these fields.
                 has_short = "short_label" in p
                 has_formula = "formula" in p
+                # FIX506.2.1.1.4 / FIX506.2.1.1.5: same presence-check
+                # pattern as short_label/formula. Slim-payload callers
+                # (GroupingPanel, etc.) omit these keys → existing DB
+                # values are preserved.
+                has_trailing = "trailing_values" in p
+                has_value_set = "accepted_value_set" in p
                 short_label = _clean_optional(p.get("short_label")) if has_short else None
                 formula = _clean_optional(p.get("formula")) if has_formula else None
+                trailing_values = (
+                    _clean_optional(p.get("trailing_values")) if has_trailing else None
+                )
+                accepted_value_set = bool(p.get("accepted_value_set")) if has_value_set else False
                 if isinstance(p.get("id"), int) and p["id"] in existing_ids:
                     set_parts = ["label = %s", "sort_order = %s"]
                     params = [label, sort_order]
@@ -524,6 +535,12 @@ def _save_setup_impl(payload):
                     if has_formula:
                         set_parts.append("formula = %s")
                         params.append(formula)
+                    if has_trailing:
+                        set_parts.append("trailing_values = %s")
+                        params.append(trailing_values)
+                    if has_value_set:
+                        set_parts.append("accepted_value_set = %s")
+                        params.append(accepted_value_set)
                     params.append(p["id"])
                     cur.execute(
                         f"update property set {', '.join(set_parts)} where id = %s",
@@ -531,9 +548,19 @@ def _save_setup_impl(payload):
                     )
                 else:
                     cur.execute(
-                        "insert into property (master_folder_id, label, short_label, formula, sort_order) "
-                        "values (%s, %s, %s, %s, %s) returning id",
-                        (master_folder_id, label, short_label, formula, sort_order),
+                        "insert into property "
+                        "  (master_folder_id, label, short_label, formula, "
+                        "   trailing_values, accepted_value_set, sort_order) "
+                        "values (%s, %s, %s, %s, %s, %s, %s) returning id",
+                        (
+                            master_folder_id,
+                            label,
+                            short_label,
+                            formula,
+                            trailing_values,
+                            accepted_value_set,
+                            sort_order,
+                        ),
                     )
                     new_id = cur.fetchone()["id"]
                     if p.get("id") is not None:
@@ -572,8 +599,9 @@ def _save_setup_impl(payload):
                 (json.dumps(view_setup), project_id),
             )
             cur.execute(
-                "select id, label, short_label, formula, sort_order from property "
-                "where master_folder_id = %s order by sort_order, id",
+                "select id, label, short_label, formula, "
+                "       trailing_values, accepted_value_set, sort_order "
+                "from property where master_folder_id = %s order by sort_order, id",
                 (master_folder_id,),
             )
             fresh_properties = cur.fetchall()
