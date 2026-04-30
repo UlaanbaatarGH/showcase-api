@@ -892,6 +892,50 @@ async def publish_folder(request: Request):
 
 
 # ============================================================
+# FIX507: storage size for the project's images
+# ============================================================
+@app.get("/api/projects/{project_id}/storage-size")
+def storage_size(project_id: int):
+    """Return the total bytes consumed in Supabase Storage by all images
+    linked to folders of this project. Reads `storage.objects.metadata`
+    (managed by Supabase Storage) so old uploads count too — no per-image
+    size column is needed in our `image` table.
+    Returns: { bytes, image_count, missing_count }
+      - bytes: sum of file sizes for matched objects
+      - image_count: total folder_image rows for this project
+      - missing_count: image rows with no matching storage object (e.g.
+        upload pending or storage_key drift)
+    """
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                with proj_imgs as (
+                    select i.id as image_id, i.storage_key
+                      from image i
+                      join folder_image fi on fi.image_id = i.id
+                      join folder f       on f.id = fi.folder_id
+                     where f.project_id = %s
+                )
+                select
+                  coalesce(sum((o.metadata->>'size')::bigint), 0) as bytes,
+                  count(distinct pi.image_id)                      as image_count,
+                  count(distinct pi.image_id) filter (where o.id is null) as missing_count
+                from proj_imgs pi
+                left join storage.objects o
+                  on o.bucket_id = %s and o.name = pi.storage_key
+                """,
+                (project_id, SUPABASE_BUCKET),
+            )
+            row = cur.fetchone() or {}
+    return {
+        "bytes": int(row.get("bytes") or 0),
+        "image_count": int(row.get("image_count") or 0),
+        "missing_count": int(row.get("missing_count") or 0),
+    }
+
+
+# ============================================================
 # FIX371: image import from disk — existing images listing + signed upload
 # ============================================================
 @app.get("/api/projects/{project_id}/existing-images")
