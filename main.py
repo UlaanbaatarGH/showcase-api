@@ -1265,6 +1265,54 @@ async def update_folder_image(
     }
 
 
+# FIX521.2.1.4: remove an image from an item. Deletes the folder_image
+# row, and when no other folder_image references the same image_id, also
+# deletes the image row + the bucket object so storage doesn't leak.
+@app.delete("/api/folder-images/{folder_image_id}")
+async def delete_folder_image(
+    folder_image_id: int,
+    user=Depends(current_user_required),
+):
+    storage_key_to_drop = None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select image_id from folder_image where id = %s",
+                (folder_image_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="folder_image not found")
+            image_id = row["image_id"]
+            cur.execute("delete from folder_image where id = %s", (folder_image_id,))
+            # Any other folder_image still pointing at this image?
+            cur.execute(
+                "select 1 from folder_image where image_id = %s limit 1",
+                (image_id,),
+            )
+            still_used = cur.fetchone() is not None
+            if not still_used:
+                cur.execute(
+                    "select storage_key from image where id = %s",
+                    (image_id,),
+                )
+                img = cur.fetchone()
+                if img:
+                    storage_key_to_drop = img["storage_key"]
+                    cur.execute("delete from image where id = %s", (image_id,))
+        conn.commit()
+    # Drop the bucket object after the DB commit so a transient bucket
+    # error doesn't roll back the user-facing remove. Any bucket failure
+    # leaves an orphan that can be cleaned later — never a half-removed
+    # row visible to the UI.
+    if storage_key_to_drop:
+        try:
+            _bucket_delete(storage_key_to_drop)
+        except HTTPException as e:
+            print(f"delete_folder_image: bucket cleanup failed for {storage_key_to_drop}: {e.detail}", flush=True)
+    return {"deleted": True, "image_deleted": storage_key_to_drop is not None}
+
+
 # FIX520.2.10 (Showcase image viewer toolbox) non-destructive save: update
 # crop rectangle and/or rotation on the Image row. The physical asset in
 # the bucket is never touched — the viewer composes the final pixels at
