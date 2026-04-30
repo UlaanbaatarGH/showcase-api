@@ -1242,17 +1242,40 @@ async def update_folder_image(
         updates.append("sort_order = %s")
         params.append(int(sort_order))
 
+    # FIX521.2.1.1.5 / <item-main-img>: per-row Main checkbox.
+    # FIX521.5.6: at most one folder_image per folder may have is_main=true,
+    # so when this row is set to true we clear the flag on every sibling
+    # in the same folder atomically.
+    set_is_main_true = False
+    if "is_main" in payload:
+        is_main = payload.get("is_main")
+        if not isinstance(is_main, bool):
+            raise HTTPException(status_code=400, detail="is_main must be a boolean")
+        updates.append("is_main = %s")
+        params.append(is_main)
+        set_is_main_true = is_main
+
     if not updates:
         raise HTTPException(status_code=400, detail="nothing to update")
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select id from folder_image where id = %s", (folder_image_id,))
-            if not cur.fetchone():
+            cur.execute(
+                "select id, folder_id from folder_image where id = %s",
+                (folder_image_id,),
+            )
+            existing = cur.fetchone()
+            if not existing:
                 raise HTTPException(status_code=404, detail="folder_image not found")
+            if set_is_main_true:
+                cur.execute(
+                    "update folder_image set is_main = false "
+                    "where folder_id = %s and id <> %s and is_main = true",
+                    (existing["folder_id"], folder_image_id),
+                )
             cur.execute(
                 f"update folder_image set {', '.join(updates)} where id = %s "
-                "returning id, caption, section, sort_order",
+                "returning id, caption, section, sort_order, is_main",
                 (*params, folder_image_id),
             )
             row = cur.fetchone()
@@ -1262,6 +1285,7 @@ async def update_folder_image(
         "caption": row["caption"],
         "section": row["section"],
         "sort_order": row["sort_order"],
+        "is_main": row["is_main"],
     }
 
 
