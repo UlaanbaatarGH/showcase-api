@@ -210,23 +210,33 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
         raise HTTPException(status_code=400, detail="page must be 'home', 'project' or 'login'")
     ip = _client_ip(request)
     user_id = user["id"] if user else None
-    # Soft dedup: skip the insert if the same (ip, page) was logged in the
-    # last 30 seconds. Filters out React StrictMode double-mount and quick
-    # refresh spam without losing genuine repeat visits.
+    # FIX412.5.1: every sign-in attempt is recorded, no dedup — failed
+    # then succeeded within seconds is a legitimate sequence the admin
+    # needs to see distinctly. For 'home' / 'project' page hits, keep
+    # the soft 30s dedup on (ip, page, user_id) so a refresh / React
+    # StrictMode double-mount doesn't double-log, but a sign-in inside
+    # the same window still produces a fresh row (different user_id).
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "insert into visit (user_id, ip, page) "
-                    "select %s, %s, %s "
-                    "where not exists ("
-                    "  select 1 from visit "
-                    "  where ip is not distinct from %s "
-                    "    and page = %s "
-                    "    and ts > now() - interval '30 seconds'"
-                    ")",
-                    (user_id, ip, page, ip, page),
-                )
+                if page == "login":
+                    cur.execute(
+                        "insert into visit (user_id, ip, page) values (%s, %s, %s)",
+                        (user_id, ip, page),
+                    )
+                else:
+                    cur.execute(
+                        "insert into visit (user_id, ip, page) "
+                        "select %s, %s, %s "
+                        "where not exists ("
+                        "  select 1 from visit "
+                        "  where ip is not distinct from %s "
+                        "    and page = %s "
+                        "    and user_id is not distinct from %s "
+                        "    and ts > now() - interval '30 seconds'"
+                        ")",
+                        (user_id, ip, page, ip, page, user_id),
+                    )
             conn.commit()
     except Exception:
         traceback.print_exc()
