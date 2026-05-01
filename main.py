@@ -667,6 +667,56 @@ def clear_project_managers(project_id: int, _admin=Depends(current_admin_require
     return {"ok": True}
 
 
+@app.patch("/api/admin/users/{user_id}")
+async def update_user(
+    user_id: str,
+    request: Request,
+    _admin=Depends(current_admin_required),
+):
+    """FIX311.5.4 / FIX311.5.5: rename or change the email of an
+    existing user. Both fields stay unique across app_user."""
+    payload = await request.json() if await request.body() else {}
+    name = payload.get("name")
+    email = payload.get("email")
+    if name is None and email is None:
+        return {"ok": True}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from app_user where id = %s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="user not found")
+            if name is not None:
+                name = name.strip()
+                if not name:
+                    raise HTTPException(status_code=400, detail="name cannot be empty")
+                cur.execute(
+                    "select 1 from app_user where login_name = %s and id != %s",
+                    (name, user_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="name already in use")
+                cur.execute(
+                    "update app_user set login_name = %s where id = %s",
+                    (name, user_id),
+                )
+            if email is not None:
+                email = email.strip()
+                if not email:
+                    raise HTTPException(status_code=400, detail="email cannot be empty")
+                cur.execute(
+                    "select 1 from app_user where email = %s and id != %s",
+                    (email, user_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="email already in use")
+                cur.execute(
+                    "update app_user set email = %s where id = %s",
+                    (email, user_id),
+                )
+        conn.commit()
+    return {"ok": True}
+
+
 @app.delete("/api/admin/users/{user_id}")
 def delete_user(user_id: str, admin=Depends(current_admin_required)):
     if user_id == admin["id"]:
