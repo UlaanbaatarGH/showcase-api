@@ -418,6 +418,105 @@ async def create_user(request: Request, _admin=Depends(current_admin_required)):
     return _user_row_to_dict({**row, "has_password": False}, [])
 
 
+# FIX317: helper that creates a Supabase auth.users row using the
+# Service Role key. Used during account redemption — the caller is
+# anonymous and trades a name + access code for a freshly-issued
+# password.
+def _supabase_admin_create_user(email: str, password: str) -> dict:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="auth not configured")
+    body = json.dumps({
+        "email": email,
+        "password": password,
+        "email_confirm": True,
+    }).encode()
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        data=body,
+        method="POST",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=400, detail=f"Supabase: {msg[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+
+@app.post("/api/auth/redeem")
+async def redeem_account(request: Request):
+    """FIX317: redeem an access code to set the user's password.
+    Body: { name, access_code, password }. Caller is anonymous —
+    after success the frontend calls supabase.auth.signInWithPassword
+    with the same name + password to obtain a session."""
+    payload = await request.json() if await request.body() else {}
+    name = (payload.get("name") or "").strip()
+    code = (payload.get("access_code") or "").strip()
+    password = payload.get("password") or ""
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if not code:
+        raise HTTPException(status_code=400, detail="access code required")
+    # FIX317.3.1.3: password ≥ 8 chars (frontend also enforces this,
+    # but the server is the source of truth).
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="password must be at least 8 characters",
+        )
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select u.id, u.login_name, u.access_code, "
+                "       (au.encrypted_password is not null) as has_password "
+                "from app_user u "
+                "left join auth.users au on au.id = u.id "
+                "where u.login_name = %s",
+                (name,),
+            )
+            row = cur.fetchone()
+            # FIX317.3.1.1 + .2: name exists, has_password is unchecked,
+            # access code matches. Same generic error for all so a
+            # caller can't tell which check failed.
+            invalid = HTTPException(
+                status_code=403,
+                detail="invalid login name or access code",
+            )
+            if not row or row["has_password"]:
+                raise invalid
+            if row["access_code"] != code:
+                raise invalid
+
+            # Login flow stays login_name → <name>@showcase.app, so
+            # use the synthetic email here too. The Email column on
+            # the Users panel is administrative metadata, not the auth
+            # identifier.
+            synthetic_email = f"{name}@showcase.app"
+            new_auth = _supabase_admin_create_user(synthetic_email, password)
+            new_id = new_auth.get("id")
+            if not new_id:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Supabase did not return a new user id",
+                )
+            # FIX317.3.1.10: rewrite app_user.id to match the new
+            # Supabase auth id, clear the access code. ON UPDATE
+            # CASCADE on the FKs keeps project_access / visit linked.
+            cur.execute(
+                "update app_user set id = %s, access_code = null where id = %s",
+                (new_id, row["id"]),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
 @app.delete("/api/admin/users/{user_id}")
 def delete_user(user_id: str, admin=Depends(current_admin_required)):
     if user_id == admin["id"]:
