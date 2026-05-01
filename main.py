@@ -165,15 +165,20 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
                 (user["id"], login_name),
             )
             row = cur.fetchone()
-            # FIX410.1.1.1.1: log this session activation as a visit. Fires
-            # on every fresh sign-in and on each page reload that picks up
-            # an existing Supabase session — close enough to "user shows
-            # up" for the Admin > Visits panel.
-            cur.execute(
-                "insert into visit (user_id) values (%s)",
-                (user["id"],),
-            )
         conn.commit()
+    # FIX410.1.1.1.1: log this session activation as a visit. Fires on every
+    # fresh sign-in and on each page reload that picks up an existing
+    # Supabase session — close enough to "user shows up" for the Admin >
+    # Visits panel. Done in a second connection so a failure here (e.g.
+    # `visit` table missing because migration 012 hasn't run yet) cannot
+    # break sign-in — the worst case is a missed log entry.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("insert into visit (user_id) values (%s)", (user["id"],))
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
     return row
 
 
