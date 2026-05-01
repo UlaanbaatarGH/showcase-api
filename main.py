@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import secrets
 import traceback
 import mimetypes
 from contextlib import contextmanager
@@ -141,6 +142,19 @@ def current_user_required(request: Request) -> dict:
     user = current_user_optional(request)
     if not user:
         raise HTTPException(status_code=401, detail="authentication required")
+    return user
+
+
+# FIX311 / FIX410: admin endpoints require profile = 'admin' on
+# app_user, on top of a valid Supabase token.
+def current_admin_required(request: Request) -> dict:
+    user = current_user_required(request)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            row = cur.fetchone()
+    if not row or row["profile"] != "admin":
+        raise HTTPException(status_code=403, detail="admin access required")
     return user
 
 
@@ -318,6 +332,104 @@ def get_ip_stats(_user=Depends(current_user_required)):
             for r in rows
         ],
     }
+
+
+# ============================================================
+# FIX311 <panel-users>: admin-only user management. Lists all
+# app_user rows with their flags + project-access summary, lets
+# the admin add (FIX311.3.1) or remove (FIX311.3.2) users.
+# ============================================================
+def _user_row_to_dict(row, projects):
+    return {
+        "id": str(row["id"]),
+        "name": row["login_name"],
+        "email": row["email"],
+        "access_code": row["access_code"],
+        "is_admin": row["profile"] == "admin",
+        "has_password": bool(row.get("has_password")),
+        "projects": projects,
+    }
+
+
+@app.get("/api/admin/users")
+def list_users(_admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # FIX311.2.1.3.1: 'has_password' is true when the linked
+            # Supabase auth.users row has an encrypted_password set.
+            # Admin-created users without a Supabase Auth row stay
+            # unchecked until they redeem their access code.
+            cur.execute(
+                "select u.id, u.login_name, u.email, u.access_code, u.profile, "
+                "       (au.encrypted_password is not null) as has_password "
+                "from app_user u "
+                "left join auth.users au on au.id = u.id "
+                "order by u.created_at"
+            )
+            users = cur.fetchall()
+            cur.execute(
+                "select pa.user_id, p.name "
+                "from project_access pa "
+                "join project p on p.id = pa.project_id "
+                "order by p.id"
+            )
+            access_rows = cur.fetchall()
+    by_user = {}
+    for r in access_rows:
+        by_user.setdefault(str(r["user_id"]), []).append(r["name"])
+    return [_user_row_to_dict(u, by_user.get(str(u["id"]), [])) for u in users]
+
+
+@app.post("/api/admin/users")
+async def create_user(request: Request, _admin=Depends(current_admin_required)):
+    payload = await request.json() if await request.body() else {}
+    name = (payload.get("name") or "").strip()
+    email = (payload.get("email") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    # FIX311.3.1.1.3: 6-digit code, leading zeros preserved (text).
+    # secrets.randbelow gives a crypto-strong choice — overkill but
+    # cheap and avoids any predictability concerns.
+    access_code = f"{secrets.randbelow(1000000):06d}"
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # FIX311.3.1.1.1: name + email must be unique across users.
+            cur.execute("select 1 from app_user where login_name = %s", (name,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="name already in use")
+            cur.execute(
+                "select 1 from app_user where email = %s and email is not null",
+                (email,),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="email already in use")
+            # FIX311.3.1.1.2: profile defaults to 'common' — never admin
+            # via this flow. FIX311.3.1.1.4: project access stays empty.
+            cur.execute(
+                "insert into app_user (id, login_name, email, profile, access_code) "
+                "values (gen_random_uuid(), %s, %s, 'common', %s) "
+                "returning id, login_name, email, access_code, profile",
+                (name, email, access_code),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _user_row_to_dict({**row, "has_password": False}, [])
+
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: str, admin=Depends(current_admin_required)):
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="cannot remove yourself")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("delete from app_user where id = %s", (user_id,))
+            removed = cur.rowcount
+        conn.commit()
+    if removed == 0:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"ok": True}
 
 
 @app.post("/api/admin/ip-name")
