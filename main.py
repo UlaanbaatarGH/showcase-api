@@ -166,19 +166,6 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
             )
             row = cur.fetchone()
         conn.commit()
-    # FIX410.1.1.1.1: log this session activation as a visit. Fires on every
-    # fresh sign-in and on each page reload that picks up an existing
-    # Supabase session — close enough to "user shows up" for the Admin >
-    # Visits panel. Done in a second connection so a failure here (e.g.
-    # `visit` table missing because migration 012 hasn't run yet) cannot
-    # break sign-in — the worst case is a missed log entry.
-    try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("insert into visit (user_id) values (%s)", (user["id"],))
-            conn.commit()
-    except Exception:
-        traceback.print_exc()
     return row
 
 
@@ -198,23 +185,74 @@ def get_me(user=Depends(current_user_required)):
 
 
 # ============================================================
-# FIX410.1.1.1.1: admin Visits panel — list users that signed in
-# with date/time, most recent first.
+# FIX410.1.1.1.1: log each consultation of <panel-app-home> /
+# <panel-project-home>. Anonymous and signed-in alike. The frontend
+# fires this from the page-mount effect.
+# FIX410.1.1.1.1.1: only "home" and "project" are valid pages — anything
+# else is rejected to keep the log scoped to what the panel displays.
 # ============================================================
+def _client_ip(request: Request) -> Optional[str]:
+    # Behind Vercel's edge rewrite, the original client IP is in
+    # X-Forwarded-For (first entry) or X-Real-IP. Fall back to the direct
+    # connection so local dev still records something.
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else None)
+
+
+@app.post("/api/track")
+async def track_visit(request: Request, user=Depends(current_user_optional)):
+    payload = await request.json() if await request.body() else {}
+    page = (payload.get("page") or "").strip()
+    if page not in ("home", "project"):
+        raise HTTPException(status_code=400, detail="page must be 'home' or 'project'")
+    ip = _client_ip(request)
+    user_id = user["id"] if user else None
+    # Soft dedup: skip the insert if the same (ip, page) was logged in the
+    # last 30 seconds. Filters out React StrictMode double-mount and quick
+    # refresh spam without losing genuine repeat visits.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "insert into visit (user_id, ip, page) "
+                    "select %s, %s, %s "
+                    "where not exists ("
+                    "  select 1 from visit "
+                    "  where ip is not distinct from %s "
+                    "    and page = %s "
+                    "    and ts > now() - interval '30 seconds'"
+                    ")",
+                    (user_id, ip, page, ip, page),
+                )
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
+    return {"ok": True}
+
+
 @app.get("/api/admin/visits")
 def list_visits(_user=Depends(current_user_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select u.login_name, v.ts "
+                "select u.login_name, v.ip, v.page, v.ts "
                 "from visit v "
-                "join app_user u on u.id = v.user_id "
+                "left join app_user u on u.id = v.user_id "
                 "order by v.ts desc "
                 "limit 200"
             )
             rows = cur.fetchall()
-    # Serialize timestamps as ISO strings so the JSON response is portable.
-    return [{"login_name": r["login_name"], "ts": r["ts"].isoformat()} for r in rows]
+    return [
+        {
+            "login_name": r["login_name"],
+            "ip": r["ip"],
+            "page": r["page"],
+            "ts": r["ts"].isoformat(),
+        }
+        for r in rows
+    ]
 
 
 # ============================================================
