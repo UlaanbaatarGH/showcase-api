@@ -165,6 +165,14 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
                 (user["id"], login_name),
             )
             row = cur.fetchone()
+            # FIX410.1.1.1.1: log this session activation as a visit. Fires
+            # on every fresh sign-in and on each page reload that picks up
+            # an existing Supabase session — close enough to "user shows
+            # up" for the Admin > Visits panel.
+            cur.execute(
+                "insert into visit (user_id) values (%s)",
+                (user["id"],),
+            )
         conn.commit()
     return row
 
@@ -182,6 +190,26 @@ def get_me(user=Depends(current_user_required)):
     if not row:
         raise HTTPException(status_code=404, detail="user row not created yet")
     return row
+
+
+# ============================================================
+# FIX410.1.1.1.1: admin Visits panel — list users that signed in
+# with date/time, most recent first.
+# ============================================================
+@app.get("/api/admin/visits")
+def list_visits(_user=Depends(current_user_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select u.login_name, v.ts "
+                "from visit v "
+                "join app_user u on u.id = v.user_id "
+                "order by v.ts desc "
+                "limit 200"
+            )
+            rows = cur.fetchall()
+    # Serialize timestamps as ISO strings so the JSON response is portable.
+    return [{"login_name": r["login_name"], "ts": r["ts"].isoformat()} for r in rows]
 
 
 # ============================================================
