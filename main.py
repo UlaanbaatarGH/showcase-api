@@ -256,6 +256,66 @@ def list_visits(_user=Depends(current_user_required)):
 
 
 # ============================================================
+# FIX413: per-IP friendly name + per-page consultation counts.
+# Single project today (FIX413.2.3.4 "{project-name1}"), so all
+# page='project' visits roll up under the first project; multi-project
+# aggregation will need page-level project_id tagging.
+# ============================================================
+@app.get("/api/admin/ip-stats")
+def get_ip_stats(_user=Depends(current_user_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id, name from project order by id")
+            projects = cur.fetchall()
+            cur.execute(
+                "select v.ip, "
+                "       coalesce(n.name, '') as name, "
+                "       sum(case when v.page = 'home' then 1 else 0 end) as home_count, "
+                "       sum(case when v.page = 'project' then 1 else 0 end) as project_count, "
+                "       max(v.ts) as last_ts "
+                "from visit v "
+                "left join ip_name n on n.ip = v.ip "
+                "where v.ip is not null "
+                "group by v.ip, n.name "
+                "order by max(v.ts) desc"
+            )
+            rows = cur.fetchall()
+    return {
+        "projects": [{"id": p["id"], "name": p["name"]} for p in projects],
+        "rows": [
+            {
+                "ip": r["ip"],
+                "name": r["name"],
+                "home_count": int(r["home_count"] or 0),
+                "project_count": int(r["project_count"] or 0),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/admin/ip-name")
+async def set_ip_name(request: Request, _user=Depends(current_user_required)):
+    payload = await request.json() if await request.body() else {}
+    ip = (payload.get("ip") or "").strip()
+    name = (payload.get("name") or "").strip()
+    if not ip:
+        raise HTTPException(status_code=400, detail="ip required")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if name == "":
+                cur.execute("delete from ip_name where ip = %s", (ip,))
+            else:
+                cur.execute(
+                    "insert into ip_name (ip, name) values (%s, %s) "
+                    "on conflict (ip) do update set name = excluded.name",
+                    (ip, name),
+                )
+        conn.commit()
+    return {"ok": True}
+
+
+# ============================================================
 # FIX400: list projects visible to caller
 # ============================================================
 @app.get("/api/projects")
