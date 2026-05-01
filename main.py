@@ -517,6 +517,156 @@ async def redeem_account(request: Request):
     return {"ok": True}
 
 
+# ============================================================
+# FIX351 <panel-project-list>: admin-only project + managers
+# management. 'Managers' = users with a project_access row for the
+# project. FIX351 spec restricts managers to users that have a
+# password set (FIX317 redeemed).
+# ============================================================
+def _check_managers_have_password(cur, manager_ids):
+    if not manager_ids:
+        return
+    cur.execute(
+        "select count(*) as c "
+        "from app_user u "
+        "left join auth.users au on au.id = u.id "
+        "where u.id = any(%s::uuid[]) "
+        "  and au.encrypted_password is null",
+        (manager_ids,),
+    )
+    if cur.fetchone()["c"] > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="all managers must have a password set",
+        )
+
+
+@app.get("/api/admin/projects")
+def list_admin_projects(_admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id, name from project order by id")
+            projects = cur.fetchall()
+            cur.execute(
+                "select pa.project_id, pa.user_id, u.login_name "
+                "from project_access pa "
+                "join app_user u on u.id = pa.user_id "
+                "order by u.login_name"
+            )
+            access_rows = cur.fetchall()
+    by_proj = {}
+    for r in access_rows:
+        by_proj.setdefault(r["project_id"], []).append({
+            "id": str(r["user_id"]),
+            "name": r["login_name"],
+        })
+    return [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "managers": by_proj.get(p["id"], []),
+        }
+        for p in projects
+    ]
+
+
+@app.post("/api/admin/projects")
+async def create_admin_project(request: Request, _admin=Depends(current_admin_required)):
+    payload = await request.json() if await request.body() else {}
+    name = (payload.get("name") or "").strip()
+    manager_id = (payload.get("manager_id") or "").strip()
+    # FIX351.2.1: name + one manager required at create time.
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if not manager_id:
+        raise HTTPException(status_code=400, detail="manager required")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from project where name = %s", (name,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="project name already in use")
+            _check_managers_have_password(cur, [manager_id])
+            # Insert project (owner_id = the manager) + a project_access
+            # row so /api/projects' permission filter sees the link.
+            # group2/group3 rights are full CRUD for now — V2 will
+            # carve these up per FIX350.10.
+            cur.execute(
+                "insert into project (name, owner_id, is_public) "
+                "values (%s, %s, true) returning id, name",
+                (name, manager_id),
+            )
+            row = cur.fetchone()
+            cur.execute(
+                "insert into project_access "
+                "(user_id, project_id, group2_rights, group3_rights) "
+                "values (%s, %s, 'CRUD', 'CRUD')",
+                (manager_id, row["id"]),
+            )
+        conn.commit()
+    return {"id": row["id"], "name": row["name"], "managers": []}
+
+
+@app.patch("/api/admin/projects/{project_id}")
+async def update_admin_project(
+    project_id: int,
+    request: Request,
+    _admin=Depends(current_admin_required),
+):
+    payload = await request.json() if await request.body() else {}
+    new_name = payload.get("name")
+    managers = payload.get("managers")  # list of user ids, or None to skip
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from project where id = %s", (project_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="project not found")
+            # FIX351.2.3: name must stay unique across projects.
+            if new_name is not None:
+                new_name = new_name.strip()
+                if not new_name:
+                    raise HTTPException(status_code=400, detail="name cannot be empty")
+                cur.execute(
+                    "select 1 from project where name = %s and id != %s",
+                    (new_name, project_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="project name already in use")
+                cur.execute(
+                    "update project set name = %s where id = %s",
+                    (new_name, project_id),
+                )
+            # FIX351.2.4: replace the managers list outright.
+            if managers is not None:
+                _check_managers_have_password(cur, managers)
+                cur.execute(
+                    "delete from project_access where project_id = %s",
+                    (project_id,),
+                )
+                for mid in managers:
+                    cur.execute(
+                        "insert into project_access "
+                        "(user_id, project_id, group2_rights, group3_rights) "
+                        "values (%s, %s, 'CRUD', 'CRUD')",
+                        (mid, project_id),
+                    )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/admin/projects/{project_id}/clear-managers")
+def clear_project_managers(project_id: int, _admin=Depends(current_admin_required)):
+    # FIX351.2.2: Remove button clears managers — does NOT delete the
+    # project itself (per spec, an "abandoned" project is allowed).
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "delete from project_access where project_id = %s",
+                (project_id,),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
 @app.delete("/api/admin/users/{user_id}")
 def delete_user(user_id: str, admin=Depends(current_admin_required)):
     if user_id == admin["id"]:
