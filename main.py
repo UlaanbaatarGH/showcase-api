@@ -581,36 +581,45 @@ def list_admin_projects(_user=Depends(current_user_required)):
 async def create_admin_project(request: Request, _admin=Depends(current_admin_required)):
     payload = await request.json() if await request.body() else {}
     name = (payload.get("name") or "").strip()
-    manager_id = (payload.get("manager_id") or "").strip()
-    # FIX351.2.1: name + one manager required at create time.
+    # FIX351.2.1 (updated): create-time accepts multiple managers.
+    # Accept the new manager_ids list; fall back to legacy singular
+    # manager_id from older clients.
+    manager_ids = payload.get("manager_ids")
+    if not isinstance(manager_ids, list):
+        legacy = (payload.get("manager_id") or "").strip()
+        manager_ids = [legacy] if legacy else []
+    manager_ids = [m for m in (manager_ids or []) if m]
+    # FIX351.2.1.1: non-blank, unique name.
     if not name:
         raise HTTPException(status_code=400, detail="name required")
-    if not manager_id:
-        raise HTTPException(status_code=400, detail="manager required")
+    # FIX351.2.1.2: at least one manager with password set.
+    if not manager_ids:
+        raise HTTPException(status_code=400, detail="at least one manager required")
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select 1 from project where name = %s", (name,))
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="project name already in use")
-            _check_managers_have_password(cur, [manager_id])
-            # Insert project (owner_id = the manager) + a project_access
-            # row so /api/projects' permission filter sees the link.
-            # group2/group3 rights are full CRUD for now — V2 will
-            # carve these up per FIX350.10.
+            _check_managers_have_password(cur, manager_ids)
+            # First manager becomes owner_id; the rest get
+            # project_access rows. is_public=true so the new project
+            # is visible on every user's home page (FIX351.2.1.4).
+            primary = manager_ids[0]
             cur.execute(
                 "insert into project (name, owner_id, is_public) "
                 "values (%s, %s, true) returning id, name",
-                (name, manager_id),
+                (name, primary),
             )
             row = cur.fetchone()
-            cur.execute(
-                "insert into project_access "
-                "(user_id, project_id, group2_rights, group3_rights) "
-                "values (%s, %s, 'CRUD', 'CRUD')",
-                (manager_id, row["id"]),
-            )
+            for mid in manager_ids:
+                cur.execute(
+                    "insert into project_access "
+                    "(user_id, project_id, group2_rights, group3_rights) "
+                    "values (%s, %s, 'CRUD', 'CRUD')",
+                    (mid, row["id"]),
+                )
         conn.commit()
-    return {"id": row["id"], "name": row["name"], "managers": []}
+    return {"id": row["id"], "name": row["name"]}
 
 
 @app.patch("/api/admin/projects/{project_id}")
