@@ -352,7 +352,11 @@ def _user_row_to_dict(row, projects):
 
 
 @app.get("/api/admin/users")
-def list_users(_admin=Depends(current_admin_required)):
+def list_users(_user=Depends(current_user_required)):
+    # Per FIX311.5.{2..5}, only the editing affordances (add, remove,
+    # rename, change email) are admin-only. The list itself is
+    # visible to every signed-in user — they just see it read-only,
+    # which the frontend enforces by hiding the toolbar.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # FIX311.2.1.3.1: 'has_password' is true when the linked
@@ -542,7 +546,10 @@ def _check_managers_have_password(cur, manager_ids):
 
 
 @app.get("/api/admin/projects")
-def list_admin_projects(_admin=Depends(current_admin_required)):
+def list_admin_projects(_user=Depends(current_user_required)):
+    # Spec FIX351 doesn't restrict reading the project list; only the
+    # write actions (add, rename, swap managers, clear managers) are
+    # admin-only and stay guarded by current_admin_required.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select id, name from project order by id")
