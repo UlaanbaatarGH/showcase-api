@@ -205,11 +205,22 @@ def _client_ip(request: Request) -> Optional[str]:
 async def track_visit(request: Request, user=Depends(current_user_optional)):
     payload = await request.json() if await request.body() else {}
     page = (payload.get("page") or "").strip()
-    # FIX412.5.1: 'login' is a sign-in attempt (success or fail).
-    if page not in ("home", "project", "login"):
-        raise HTTPException(status_code=400, detail="page must be 'home', 'project' or 'login'")
+    # FIX412.5.1.2: 'login_ok' / 'login_failed' replace the old single
+    # 'login' tag — the page value itself encodes whether the attempt
+    # succeeded. 'login' kept accepted for backward compatibility with
+    # rows from an older client.
+    valid_pages = ("home", "project", "login_ok", "login_failed", "login")
+    if page not in valid_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"page must be one of {valid_pages}",
+        )
     ip = _client_ip(request)
     user_id = user["id"] if user else None
+    # FIX412.5.1.1: store the name the user typed at sign-in so the
+    # User column can display it even when the attempt failed (and
+    # therefore has no app_user join). Only meaningful for login rows.
+    typed_login = (payload.get("login_name") or "").strip() or None
     # FIX412.5.1: every sign-in attempt is recorded, no dedup — failed
     # then succeeded within seconds is a legitimate sequence the admin
     # needs to see distinctly. For 'home' / 'project' page hits, keep
@@ -219,10 +230,11 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                if page == "login":
+                if page.startswith("login"):
                     cur.execute(
-                        "insert into visit (user_id, ip, page) values (%s, %s, %s)",
-                        (user_id, ip, page),
+                        "insert into visit (user_id, ip, page, typed_login) "
+                        "values (%s, %s, %s, %s)",
+                        (user_id, ip, page, typed_login),
                     )
                 else:
                     cur.execute(
@@ -248,7 +260,7 @@ def list_visits(_user=Depends(current_user_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select u.login_name, v.ip, v.page, v.ts "
+                "select u.login_name, v.ip, v.page, v.ts, v.typed_login "
                 "from visit v "
                 "left join app_user u on u.id = v.user_id "
                 "order by v.ts desc "
@@ -261,6 +273,7 @@ def list_visits(_user=Depends(current_user_required)):
             "ip": r["ip"],
             "page": r["page"],
             "ts": r["ts"].isoformat(),
+            "typed_login": r["typed_login"],
         }
         for r in rows
     ]
