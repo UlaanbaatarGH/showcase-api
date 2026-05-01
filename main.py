@@ -205,8 +205,9 @@ def _client_ip(request: Request) -> Optional[str]:
 async def track_visit(request: Request, user=Depends(current_user_optional)):
     payload = await request.json() if await request.body() else {}
     page = (payload.get("page") or "").strip()
-    if page not in ("home", "project"):
-        raise HTTPException(status_code=400, detail="page must be 'home' or 'project'")
+    # FIX412.5.1: 'login' is a sign-in attempt (success or fail).
+    if page not in ("home", "project", "login"):
+        raise HTTPException(status_code=400, detail="page must be 'home', 'project' or 'login'")
     ip = _client_ip(request)
     user_id = user["id"] if user else None
     # Soft dedup: skip the insert if the same (ip, page) was logged in the
