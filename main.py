@@ -548,11 +548,15 @@ def _check_managers_have_password(cur, manager_ids):
 @app.get("/api/admin/projects")
 def list_admin_projects(_user=Depends(current_user_required)):
     # Spec FIX351 doesn't restrict reading the project list; only the
-    # write actions (add, rename, swap managers, clear managers) are
-    # admin-only and stay guarded by current_admin_required.
+    # write actions (add, rename, swap managers, clear managers, move)
+    # are admin-only and stay guarded by current_admin_required.
+    # FIX400.2.1.1: order matches the panel's stored sort order.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select id, name from project order by id")
+            cur.execute(
+                "select id, name, is_public, sort_order "
+                "from project order by sort_order, id"
+            )
             projects = cur.fetchall()
             cur.execute(
                 "select pa.project_id, pa.user_id, u.login_name "
@@ -571,6 +575,7 @@ def list_admin_projects(_user=Depends(current_user_required)):
         {
             "id": p["id"],
             "name": p["name"],
+            "is_public": bool(p["is_public"]),
             "managers": by_proj.get(p["id"], []),
         }
         for p in projects
@@ -602,13 +607,20 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
                 raise HTTPException(status_code=409, detail="project name already in use")
             _check_managers_have_password(cur, manager_ids)
             # First manager becomes owner_id; the rest get
-            # project_access rows. is_public=true so the new project
-            # is visible on every user's home page (FIX351.2.1.4).
+            # project_access rows. FIX351.2.1.3.1 + FIX400.2.1.{2,3}:
+            # new projects are private by default — admin must flip
+            # is_public on for them to appear to anyone.
             primary = manager_ids[0]
+            # Append at the end of the order list (FIX351.2.7/.2.8).
             cur.execute(
-                "insert into project (name, owner_id, is_public) "
-                "values (%s, %s, true) returning id, name",
-                (name, primary),
+                "select coalesce(max(sort_order), 0) + 10 as next "
+                "from project"
+            )
+            next_order = cur.fetchone()["next"]
+            cur.execute(
+                "insert into project (name, owner_id, is_public, sort_order) "
+                "values (%s, %s, false, %s) returning id, name",
+                (name, primary, next_order),
             )
             row = cur.fetchone()
             for mid in manager_ids:
@@ -631,11 +643,18 @@ async def update_admin_project(
     payload = await request.json() if await request.body() else {}
     new_name = payload.get("name")
     managers = payload.get("managers")  # list of user ids, or None to skip
+    is_public = payload.get("is_public")  # bool or None to skip
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select 1 from project where id = %s", (project_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="project not found")
+            # FIX351.2.1.3 / FIX400.2.1.{2,3}: <project-is-public> toggle.
+            if is_public is not None:
+                cur.execute(
+                    "update project set is_public = %s where id = %s",
+                    (bool(is_public), project_id),
+                )
             # FIX351.2.3: name must stay unique across projects.
             if new_name is not None:
                 new_name = new_name.strip()
@@ -665,6 +684,68 @@ async def update_admin_project(
                         "values (%s, %s, 'CRUD', 'CRUD')",
                         (mid, project_id),
                     )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/admin/projects/{project_id}/move")
+async def move_admin_project(
+    project_id: int,
+    request: Request,
+    _admin=Depends(current_admin_required),
+):
+    """FIX351.2.7 / FIX351.2.8: swap sort_order with the previous
+    (direction='up') or next (direction='down') project in the panel
+    order. No-ops at the bounds — the buttons should already be
+    disabled there."""
+    payload = await request.json() if await request.body() else {}
+    direction = (payload.get("direction") or "").strip()
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select id, sort_order from project where id = %s",
+                (project_id,),
+            )
+            me = cur.fetchone()
+            if not me:
+                raise HTTPException(status_code=404, detail="project not found")
+            if direction == "up":
+                cur.execute(
+                    "select id, sort_order from project "
+                    "where (sort_order, id) < (%s, %s) "
+                    "order by sort_order desc, id desc limit 1",
+                    (me["sort_order"], me["id"]),
+                )
+            else:
+                cur.execute(
+                    "select id, sort_order from project "
+                    "where (sort_order, id) > (%s, %s) "
+                    "order by sort_order asc, id asc limit 1",
+                    (me["sort_order"], me["id"]),
+                )
+            neighbour = cur.fetchone()
+            if not neighbour:
+                # Already at the requested edge — silently no-op.
+                return {"ok": True}
+            # If the neighbour shares the same sort_order, just decrement
+            # / increment ours; otherwise swap the two values.
+            if neighbour["sort_order"] == me["sort_order"]:
+                delta = -1 if direction == "up" else 1
+                cur.execute(
+                    "update project set sort_order = sort_order + %s where id = %s",
+                    (delta, me["id"]),
+                )
+            else:
+                cur.execute(
+                    "update project set sort_order = %s where id = %s",
+                    (neighbour["sort_order"], me["id"]),
+                )
+                cur.execute(
+                    "update project set sort_order = %s where id = %s",
+                    (me["sort_order"], neighbour["id"]),
+                )
         conn.commit()
     return {"ok": True}
 
@@ -774,9 +855,14 @@ async def set_ip_name(request: Request, _user=Depends(current_user_required)):
 @app.get("/api/projects")
 def list_projects(user=Depends(current_user_optional)):
     """
-    FIX400.4.1: anonymous callers see only public projects.
-    FIX400.4.2: signed-in callers also see private projects they own
-                or have any project_access row for.
+    FIX400.2.1.1: ordered by sort_order (then id), matching the admin
+    panel's order (FIX351.2.7 / FIX351.2.8).
+    FIX400.2.1.2: is_public projects are visible to anyone.
+    FIX400.2.1.3: private projects are visible only to the admin user
+    and to the project's managers (project_access rows). The owner
+    inherits visibility too — first successful edit claims ownership
+    via PATCH /api/projects/:id below, so unowned-OR-owner is the
+    historical proxy for the same intent.
     """
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -785,26 +871,36 @@ def list_projects(user=Depends(current_user_optional)):
                     "select id, name, cover_image_key, is_public, "
                     "       false as can_edit "
                     "from project where is_public "
-                    "order by name, id"
+                    "order by sort_order, id"
                 )
             else:
-                # FIX400.3.2.1 / FIX400.4.3: can_edit flags projects the
-                # signed-in user is allowed to rename / re-cover. True when
-                # the user is the owner OR the project is unowned
-                # (owner_id IS NULL) — the first successful edit auto-claims
-                # ownership in PATCH /api/projects/:id below.
+                # Admins see every project regardless of visibility flags.
                 cur.execute(
-                    "select distinct p.id, p.name, p.cover_image_key, p.is_public, "
-                    "       (p.owner_id = %s or p.owner_id is null) as can_edit "
-                    "from project p "
-                    "left join project_access pa "
-                    "       on pa.project_id = p.id and pa.user_id = %s "
-                    "where p.is_public "
-                    "   or pa.user_id is not null "
-                    "   or p.owner_id = %s "
-                    "order by p.name, p.id",
-                    (user["id"], user["id"], user["id"]),
+                    "select profile from app_user where id = %s",
+                    (user["id"],),
                 )
+                pr = cur.fetchone()
+                is_caller_admin = bool(pr and pr["profile"] == "admin")
+                if is_caller_admin:
+                    cur.execute(
+                        "select p.id, p.name, p.cover_image_key, p.is_public, "
+                        "       true as can_edit "
+                        "from project p "
+                        "order by p.sort_order, p.id"
+                    )
+                else:
+                    cur.execute(
+                        "select distinct p.id, p.name, p.cover_image_key, p.is_public, "
+                        "       (p.owner_id = %s or p.owner_id is null) as can_edit "
+                        "from project p "
+                        "left join project_access pa "
+                        "       on pa.project_id = p.id and pa.user_id = %s "
+                        "where p.is_public "
+                        "   or pa.user_id is not null "
+                        "   or p.owner_id = %s "
+                        "order by p.sort_order, p.id",
+                        (user["id"], user["id"], user["id"]),
+                    )
             rows = cur.fetchall()
     return [
         {
