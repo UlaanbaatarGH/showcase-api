@@ -1,10 +1,12 @@
 import os
 import json
+import re
 import time
 import base64
 import secrets
 import traceback
 import mimetypes
+import unicodedata
 from contextlib import contextmanager
 from typing import Optional
 import urllib.request
@@ -1051,15 +1053,44 @@ def hello():
     return row
 
 
+# FIX401.2: same slug recipe as the SPA router. Match project names
+# in Python so the URL and the DB row map to the same project even
+# when the name has accents / spaces / case differences.
+def _slugify_name(name: str) -> str:
+    nfd = unicodedata.normalize("NFD", name or "")
+    plain = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]+", "", plain.lower())
+
+
 @app.get("/api/showcase")
-def showcase():
+def showcase(slug: Optional[str] = None):
+    """FIX401.2: scoped to one project. With ?slug= the route resolves
+    that specific project; without it (legacy callers) we still pick
+    the first project in panel order so old single-project clients
+    keep working."""
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "select id, name, view_setup from project order by id limit 1"
-            )
-            project = cur.fetchone()
+            if slug:
+                cur.execute(
+                    "select id, name, view_setup from project order by sort_order, id"
+                )
+                rows = cur.fetchall()
+                project = next(
+                    (r for r in rows if _slugify_name(r["name"]) == slug),
+                    None,
+                )
+                if not project:
+                    raise HTTPException(status_code=404, detail="project not found")
+            else:
+                cur.execute(
+                    "select id, name, view_setup from project "
+                    "order by sort_order, id limit 1"
+                )
+                project = cur.fetchone()
             if not project:
+                # FIX401.2.1: a brand-new (and only) project may have no
+                # data yet. Return empty arrays — the frontend renders
+                # the empty showcase gracefully.
                 return {
                     "project": None,
                     "properties": [],
@@ -1136,12 +1167,26 @@ async def save_setup(request: Request):
 
 
 def _save_setup_impl(payload):
+    # FIX401.2: setup writes are scoped to the caller's current
+    # project. The frontend passes project_id alongside the
+    # properties/view_setup payload; old clients that omit it still
+    # get the first-in-panel-order project so single-project setups
+    # don't break.
+    payload_project_id = payload.get("project_id")
     incoming_props = payload.get("properties", [])
     view_setup = payload.get("view_setup", {}) or {}
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select id from project order by id limit 1")
+            if payload_project_id is not None:
+                cur.execute(
+                    "select id from project where id = %s",
+                    (payload_project_id,),
+                )
+            else:
+                cur.execute(
+                    "select id from project order by sort_order, id limit 1"
+                )
             project = cur.fetchone()
             if not project:
                 raise HTTPException(status_code=404, detail="no project")
