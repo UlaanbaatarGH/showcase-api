@@ -296,6 +296,7 @@ def get_ip_stats(_user=Depends(current_user_required)):
                 "       coalesce(n.name, '') as name, "
                 "       sum(case when v.page = 'home' then 1 else 0 end) as home_count, "
                 "       sum(case when v.page = 'project' then 1 else 0 end) as project_count, "
+                "       sum(case when v.page like 'login%' then 1 else 0 end) as login_count, "
                 "       max(v.ts) as last_ts "
                 "from visit v "
                 "left join ip_name n on n.ip = v.ip "
@@ -312,6 +313,7 @@ def get_ip_stats(_user=Depends(current_user_required)):
                 "name": r["name"],
                 "home_count": int(r["home_count"] or 0),
                 "project_count": int(r["project_count"] or 0),
+                "login_count": int(r["login_count"] or 0),
             }
             for r in rows
         ],
