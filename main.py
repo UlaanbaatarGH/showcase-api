@@ -258,7 +258,7 @@ def list_visits(_user=Depends(current_user_required)):
 
 # ============================================================
 # FIX413: per-IP friendly name + per-page consultation counts.
-# Single project today (FIX413.2.3.4 "{project-name1}"), so all
+# Single project today (FIX413.2.1.4 "{project-name1}"), so all
 # page='project' visits roll up under the first project; multi-project
 # aggregation will need page-level project_id tagging.
 # ============================================================
