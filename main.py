@@ -402,7 +402,11 @@ async def create_user(request: Request, _admin=Depends(current_admin_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # FIX311.3.1.1.1: name + email must be unique across users.
-            cur.execute("select 1 from app_user where login_name = %s", (name,))
+            # Case-insensitive: 'Herve' and 'herve' are the same handle.
+            cur.execute(
+                "select 1 from app_user where lower(login_name) = lower(%s)",
+                (name,),
+            )
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="name already in use")
             cur.execute(
@@ -484,7 +488,7 @@ async def redeem_account(request: Request):
                 "       (au.encrypted_password is not null) as has_password "
                 "from app_user u "
                 "left join auth.users au on au.id = u.id "
-                "where u.login_name = %s",
+                "where lower(u.login_name) = lower(%s)",
                 (name,),
             )
             row = cur.fetchone()
@@ -501,10 +505,13 @@ async def redeem_account(request: Request):
                 raise invalid
 
             # Login flow stays login_name → <name>@showcase.app, so
-            # use the synthetic email here too. The Email column on
-            # the Users panel is administrative metadata, not the auth
-            # identifier.
-            synthetic_email = f"{name}@showcase.app"
+            # use the synthetic email here too. Lowercased to match the
+            # frontend's loginNameToEmail() (Supabase Auth normalises
+            # to lowercase internally too — being explicit avoids any
+            # surprise around what the auth row's email actually is).
+            # The Email column on the Users panel is administrative
+            # metadata, not the auth identifier.
+            synthetic_email = f"{name.lower()}@showcase.app"
             new_auth = _supabase_admin_create_user(synthetic_email, password)
             new_id = new_auth.get("id")
             if not new_id:
@@ -799,7 +806,8 @@ async def update_user(
                 if not name:
                     raise HTTPException(status_code=400, detail="name cannot be empty")
                 cur.execute(
-                    "select 1 from app_user where login_name = %s and id != %s",
+                    "select 1 from app_user "
+                    "where lower(login_name) = lower(%s) and id != %s",
                     (name, user_id),
                 )
                 if cur.fetchone():
