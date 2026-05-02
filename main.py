@@ -623,7 +623,7 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
         legacy = (payload.get("manager_id") or "").strip()
         manager_ids = [legacy] if legacy else []
     manager_ids = [m for m in (manager_ids or []) if m]
-    # FIX351.2.1.1: non-blank, unique name.
+    # FIX351.2.1.2 [ex-351.2.1.1]: non-blank, unique name.
     if not name:
         raise HTTPException(status_code=400, detail="name required")
     # FIX351.2.1.2 (removed): managers can now be assigned later via
