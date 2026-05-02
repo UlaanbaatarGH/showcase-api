@@ -10,6 +10,7 @@ import traceback
 import mimetypes
 import unicodedata
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Optional
 import urllib.request
 import urllib.error
@@ -616,23 +617,32 @@ def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     return None
 
 
-def _send_contact_email(subject: str, message: str, sender_email: str) -> Optional[str]:
+def _send_contact_email(
+    subject: str,
+    message: str,
+    sender_email: str,
+    project_name: Optional[str] = None,
+) -> Optional[str]:
     """Best-effort Resend send. Failures are swallowed so a Resend
     outage doesn't drop the user's message — the row is already in
     contact_message and the admin can pick it up from there. Returns
     the echo message id when one was sent (used by /api/contact to
-    store it on the row so a later bounce webhook can find it)."""
+    store it on the row so a later bounce webhook can find it).
+
+    FIX420.4.2.{1,2}: the auto-reply subject + body name the project
+    the message was about and the date/time it was received."""
     contact_to = _resolve_contact_to()
     if not RESEND_API_KEY or not contact_to:
         print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
         return None
     # 1) Forward the message to the admin inbox.
+    project_tag = f" [{project_name}]" if project_name else ""
     _resend_send(
         {
             "from": RESEND_FROM,
             "to": [contact_to],
             "reply_to": sender_email,
-            "subject": subject,
+            "subject": f"{subject}{project_tag}",
             "text": f"Sender: {sender_email}\n\n{message}",
         },
         label="admin forward",
@@ -643,9 +653,16 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> Option
     # reachable). Until then this stays dormant.
     echo_id: Optional[str] = None
     if RESEND_NOREPLY_FROM:
+        # FIX420.4.2.2 body shape: thank + project + date/time, then
+        # 'we'll reply soon', then the original subject + content.
+        when = datetime.now().strftime("%a %d %b %Y / %H:%M")
+        proj_label = project_name or "the project"
+        echo_subject = f"We received your message about {proj_label}"
         echo_body = (
-            "Thanks for your message — we've received it and will "
-            "get back to you soon.\n"
+            f"Thank you for your message about \"{proj_label}\" on "
+            f"{when}.\n"
+            "\n"
+            "We will reply soon.\n"
             "\n"
             "(This is an automated acknowledgement; please do not "
             "reply to this address.)\n"
@@ -659,7 +676,7 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> Option
             {
                 "from": RESEND_NOREPLY_FROM,
                 "to": [sender_email],
-                "subject": f"Re: {subject}",
+                "subject": echo_subject,
                 "text": echo_body,
             },
             label="sender echo",
@@ -857,8 +874,19 @@ async def contact_admin(request: Request):
                 (ip, subject, message, email, project_id),
             )
             row_id = cur.fetchone()["id"]
+            # FIX420.4.2.2: fetch the project name so the echo can
+            # include it in the subject and body.
+            project_name: Optional[str] = None
+            if project_id is not None:
+                cur.execute(
+                    "select name from project where id = %s",
+                    (project_id,),
+                )
+                pr = cur.fetchone()
+                if pr:
+                    project_name = pr["name"]
         conn.commit()
-    echo_message_id = _send_contact_email(subject, message, email)
+    echo_message_id = _send_contact_email(subject, message, email, project_name)
     if echo_message_id:
         # Best-effort: link the echo's Resend id to the row so the
         # webhook can flip email_invalid later. Failure here is
