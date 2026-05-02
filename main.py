@@ -182,17 +182,30 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
             )
             row = cur.fetchone()
             row["managed_project_ids"] = _managed_project_ids(cur, user["id"])
+            row["user_managed_project_ids"] = _user_managed_project_ids(cur, user["id"])
         conn.commit()
     return row
 
 
 def _managed_project_ids(cur, user_id) -> list:
     # FIX311.5.6 / FIX351.2.x: list of project ids the caller has a
-    # project_access row for. Frontend uses this to know if the caller
-    # is a Project Manager (and of which projects), so it can filter
-    # the projects available in the user-projects editor.
+    # project_access row for, regardless of role. Used by the header
+    # gating (admin-or-manager) and the FIX351.5.7 enable rule for
+    # <button-edit-project>.
     cur.execute(
         "select project_id from project_access where user_id = %s",
+        (user_id,),
+    )
+    return [r["project_id"] for r in cur.fetchall()]
+
+
+def _user_managed_project_ids(cur, user_id) -> list:
+    # FIX312.5.2: User Managers (project_access rows with
+    # is_user_manager=true) are the ones allowed to assign or
+    # unassign their project to other users.
+    cur.execute(
+        "select project_id from project_access "
+        "where user_id = %s and is_user_manager",
         (user_id,),
     )
     return [r["project_id"] for r in cur.fetchall()]
@@ -210,6 +223,9 @@ def get_me(user=Depends(current_user_required)):
             row = cur.fetchone()
             if row is not None:
                 row["managed_project_ids"] = _managed_project_ids(cur, user["id"])
+                row["user_managed_project_ids"] = _user_managed_project_ids(
+                    cur, user["id"],
+                )
     if not row:
         raise HTTPException(status_code=404, detail="user row not created yet")
     return row
@@ -623,6 +639,10 @@ def list_admin_projects(_user=Depends(current_user_required)):
     # write actions (add, rename, swap managers, clear managers, move)
     # are admin-only and stay guarded by current_admin_required.
     # FIX400.2.1.1: order matches the panel's stored sort order.
+    # FIX351.2.1.2 / .1.5: a project_access row carries two roles
+    # (is_data_manager, is_user_manager) — the response surfaces both
+    # lists separately so the projects table can render them in their
+    # own columns.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -631,27 +651,47 @@ def list_admin_projects(_user=Depends(current_user_required)):
             )
             projects = cur.fetchall()
             cur.execute(
-                "select pa.project_id, pa.user_id, u.login_name "
+                "select pa.project_id, pa.user_id, u.login_name, "
+                "       pa.is_data_manager, pa.is_user_manager "
                 "from project_access pa "
                 "join app_user u on u.id = pa.user_id "
                 "order by u.login_name"
             )
             access_rows = cur.fetchall()
-    by_proj = {}
+    data_by_proj = {}
+    user_by_proj = {}
     for r in access_rows:
-        by_proj.setdefault(r["project_id"], []).append({
-            "id": str(r["user_id"]),
-            "name": r["login_name"],
-        })
+        entry = {"id": str(r["user_id"]), "name": r["login_name"]}
+        if r["is_data_manager"]:
+            data_by_proj.setdefault(r["project_id"], []).append(entry)
+        if r["is_user_manager"]:
+            user_by_proj.setdefault(r["project_id"], []).append(entry)
     return [
         {
             "id": p["id"],
             "name": p["name"],
             "is_public": bool(p["is_public"]),
-            "managers": by_proj.get(p["id"], []),
+            # `managers` kept for backward-compat callers — the union
+            # of both roles, deduped by user id.
+            "managers": _dedup_by_id(
+                data_by_proj.get(p["id"], []) + user_by_proj.get(p["id"], []),
+            ),
+            "data_managers": data_by_proj.get(p["id"], []),
+            "user_managers": user_by_proj.get(p["id"], []),
         }
         for p in projects
     ]
+
+
+def _dedup_by_id(items):
+    seen = set()
+    out = []
+    for it in items:
+        if it["id"] in seen:
+            continue
+        seen.add(it["id"])
+        out.append(it)
+    return out
 
 
 @app.post("/api/admin/projects")
@@ -705,11 +745,15 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
                 "values (%s, %s, 0, true)",
                 (row["id"], name),
             )
+            # New project's managers are full data + user managers.
+            # The owner (first manager) is intentionally given both
+            # roles so they can immediately assign access to others.
             for mid in manager_ids:
                 cur.execute(
                     "insert into project_access "
-                    "(user_id, project_id, group2_rights, group3_rights) "
-                    "values (%s, %s, 'CRUD', 'CRUD')",
+                    "(user_id, project_id, is_data_manager, is_user_manager, "
+                    " group2_rights, group3_rights) "
+                    "values (%s, %s, true, true, 'CRUD', 'CRUD')",
                     (mid, row["id"]),
                 )
         conn.commit()
@@ -720,24 +764,60 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
 async def update_admin_project(
     project_id: int,
     request: Request,
-    _admin=Depends(current_admin_required),
+    user=Depends(current_user_required),
 ):
+    """FIX352 <panel-project> persistence. Caller must be an admin OR a
+    User Manager of the project (FIX351.5.7 + FIX352.3). Admins can
+    also rewrite <project-user-managers> (FIX352.3.10.11); other
+    callers are limited to name / data managers / is_public."""
     payload = await request.json() if await request.body() else {}
     new_name = payload.get("name")
-    managers = payload.get("managers")  # list of user ids, or None to skip
     is_public = payload.get("is_public")  # bool or None to skip
+    data_managers = payload.get("data_managers")
+    user_managers = payload.get("user_managers")
+    # Backward compat: legacy clients send 'managers' meaning both
+    # roles at once — treat the list as both data + user managers so
+    # the row state matches the pre-split semantics.
+    legacy_managers = (
+        payload.get("managers")
+        if data_managers is None and user_managers is None
+        else None
+    )
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select 1 from project where id = %s", (project_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="project not found")
+            # FIX351.5.7: caller must be admin or User Manager of this
+            # project. FIX352.3.10.11: only admins may touch
+            # <project-user-managers>.
+            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            pr = cur.fetchone()
+            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            if not caller_is_admin:
+                cur.execute(
+                    "select 1 from project_access "
+                    "where user_id = %s and project_id = %s and is_user_manager",
+                    (user["id"], project_id),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(
+                        status_code=403,
+                        detail="must be admin or User Manager of this project",
+                    )
+                if user_managers is not None or legacy_managers is not None:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="only admin can change user managers",
+                    )
             # FIX351.2.1.3 / FIX400.2.1.{2,3}: <project-is-public> toggle.
             if is_public is not None:
                 cur.execute(
                     "update project set is_public = %s where id = %s",
                     (bool(is_public), project_id),
                 )
-            # FIX351.2.3: name must stay unique across projects.
+            # FIX352.3.10.1 [ex-351.2.3]: name must be non-blank and
+            # unique across projects.
             if new_name is not None:
                 new_name = new_name.strip()
                 if not new_name:
@@ -752,19 +832,30 @@ async def update_admin_project(
                     "update project set name = %s where id = %s",
                     (new_name, project_id),
                 )
-            # FIX351.2.4: replace the managers list outright.
-            if managers is not None:
-                _check_managers_have_password(cur, managers)
+            # FIX352.3.10.10: replace the manager rosters. We rebuild
+            # the project_access rows for this project from the union
+            # of (data_managers, user_managers); each row carries both
+            # role flags as appropriate.
+            if data_managers is not None or user_managers is not None or legacy_managers is not None:
+                if legacy_managers is not None:
+                    data_set = set(legacy_managers or [])
+                    user_set = set(legacy_managers or [])
+                else:
+                    data_set = set(data_managers or [])
+                    user_set = set(user_managers or [])
+                all_set = data_set | user_set
+                _check_managers_have_password(cur, list(all_set))
                 cur.execute(
                     "delete from project_access where project_id = %s",
                     (project_id,),
                 )
-                for mid in managers:
+                for uid in all_set:
                     cur.execute(
                         "insert into project_access "
-                        "(user_id, project_id, group2_rights, group3_rights) "
-                        "values (%s, %s, 'CRUD', 'CRUD')",
-                        (mid, project_id),
+                        "(user_id, project_id, is_data_manager, is_user_manager, "
+                        " group2_rights, group3_rights) "
+                        "values (%s, %s, %s, %s, 'CRUD', 'CRUD')",
+                        (uid, project_id, uid in data_set, uid in user_set),
                     )
         conn.commit()
     return {"ok": True}
@@ -913,22 +1004,24 @@ def delete_user(user_id: str, admin=Depends(current_admin_required)):
     return {"ok": True}
 
 
-def _require_admin_or_manager_of(cur, caller_id: str, project_id: int) -> None:
-    """FIX311.5.6 / FIX351.2.x: editing a user's <user-projects> entry
-    for project P is allowed when the caller is a global admin OR has
-    a project_access row for P (= is a Project Manager of P)."""
+def _require_admin_or_user_manager_of(cur, caller_id: str, project_id: int) -> None:
+    """FIX311.5.6 / FIX312.5.2: editing a user's <user-projects> entry
+    for project P is allowed only when the caller is a global admin
+    OR a User Manager of P (project_access row with is_user_manager
+    true). Plain Data Managers cannot grant access to others."""
     cur.execute("select profile from app_user where id = %s", (caller_id,))
     pr = cur.fetchone()
     if pr and pr["profile"] == "admin":
         return
     cur.execute(
-        "select 1 from project_access where user_id = %s and project_id = %s",
+        "select 1 from project_access "
+        "where user_id = %s and project_id = %s and is_user_manager",
         (caller_id, project_id),
     )
     if not cur.fetchone():
         raise HTTPException(
             status_code=403,
-            detail="must be admin or a manager of this project",
+            detail="must be admin or a User Manager of this project",
         )
 
 
@@ -944,17 +1037,21 @@ def grant_user_project(
     no-op."""
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            _require_admin_or_manager_of(cur, caller["id"], project_id)
+            _require_admin_or_user_manager_of(cur, caller["id"], project_id)
             cur.execute("select 1 from app_user where id = %s", (user_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="user not found")
             cur.execute("select 1 from project where id = %s", (project_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="project not found")
+            # New row defaults to (is_data_manager=true,
+            # is_user_manager=false). Promotion to User Manager is
+            # admin-only via <panel-project> (FIX352.3.10.11).
             cur.execute(
                 "insert into project_access "
-                "(user_id, project_id, group2_rights, group3_rights) "
-                "values (%s, %s, 'CRUD', 'CRUD') "
+                "(user_id, project_id, is_data_manager, is_user_manager, "
+                " group2_rights, group3_rights) "
+                "values (%s, %s, true, false, 'CRUD', 'CRUD') "
                 "on conflict (user_id, project_id) do nothing",
                 (user_id, project_id),
             )
@@ -974,7 +1071,7 @@ def revoke_user_project(
     user is implicitly removed from the project's managers too."""
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            _require_admin_or_manager_of(cur, caller["id"], project_id)
+            _require_admin_or_user_manager_of(cur, caller["id"], project_id)
             cur.execute(
                 "delete from project_access "
                 "where user_id = %s and project_id = %s",
