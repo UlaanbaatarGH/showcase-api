@@ -3,6 +3,8 @@ import json
 import re
 import time
 import base64
+import hashlib
+import hmac
 import secrets
 import traceback
 import mimetypes
@@ -576,10 +578,11 @@ def _resolve_contact_to() -> Optional[str]:
     return CONTACT_TO_FALLBACK
 
 
-def _resend_send(payload: dict, *, label: str) -> bool:
+def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     """Internal Resend POST wrapper. Surfaces Resend's JSON error
     body in the log so the admin can diagnose without parsing a
-    Python traceback. Returns True on success."""
+    Python traceback. Returns the parsed JSON on success (with the
+    'id' field carrying Resend's message id) or None on failure."""
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         "https://api.resend.com/emails",
@@ -596,8 +599,8 @@ def _resend_send(payload: dict, *, label: str) -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15):
-            return True
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_text = ""
         try:
@@ -610,17 +613,19 @@ def _resend_send(payload: dict, *, label: str) -> bool:
         )
     except Exception:
         traceback.print_exc()
-    return False
+    return None
 
 
-def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
+def _send_contact_email(subject: str, message: str, sender_email: str) -> Optional[str]:
     """Best-effort Resend send. Failures are swallowed so a Resend
     outage doesn't drop the user's message — the row is already in
-    contact_message and the admin can pick it up from there."""
+    contact_message and the admin can pick it up from there. Returns
+    the echo message id when one was sent (used by /api/contact to
+    store it on the row so a later bounce webhook can find it)."""
     contact_to = _resolve_contact_to()
     if not RESEND_API_KEY or not contact_to:
         print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
-        return
+        return None
     # 1) Forward the message to the admin inbox.
     _resend_send(
         {
@@ -636,6 +641,7 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
     # RESEND_NOREPLY_FROM being configured (which presumes the
     # domain is verified in Resend so arbitrary recipients are
     # reachable). Until then this stays dormant.
+    echo_id: Optional[str] = None
     if RESEND_NOREPLY_FROM:
         echo_body = (
             "Thanks for your message — we've received it and will "
@@ -649,7 +655,7 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
             "\n"
             f"{message}\n"
         )
-        _resend_send(
+        echo_resp = _resend_send(
             {
                 "from": RESEND_NOREPLY_FROM,
                 "to": [sender_email],
@@ -658,6 +664,11 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
             },
             label="sender echo",
         )
+        if echo_resp:
+            mid = echo_resp.get("id")
+            if isinstance(mid, str) and mid:
+                echo_id = mid
+    return echo_id
 
 
 @app.post("/api/auth/redeem")
@@ -832,11 +843,112 @@ async def contact_admin(request: Request):
                     )
             cur.execute(
                 "insert into contact_message (ip, subject, body, sender_email) "
-                "values (%s, %s, %s, %s)",
+                "values (%s, %s, %s, %s) returning id",
                 (ip, subject, message, email),
             )
+            row_id = cur.fetchone()["id"]
         conn.commit()
-    _send_contact_email(subject, message, email)
+    echo_message_id = _send_contact_email(subject, message, email)
+    if echo_message_id:
+        # Best-effort: link the echo's Resend id to the row so the
+        # webhook can flip email_invalid later. Failure here is
+        # non-fatal — worst case the bounce just isn't recorded.
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "update contact_message set echo_message_id = %s "
+                        "where id = %s",
+                        (echo_message_id, row_id),
+                    )
+                conn.commit()
+        except Exception:
+            traceback.print_exc()
+    return {"ok": True}
+
+
+# ============================================================
+# FIX420 (bounce detection): Resend webhook receiver. Configured
+# once in Resend's dashboard with this URL + a signing secret in
+# RESEND_WEBHOOK_SECRET. On a bounce or complaint we flip
+# email_invalid on the matching contact_message row so the admin
+# knows not to bother replying.
+# ============================================================
+RESEND_WEBHOOK_SECRET = os.environ.get("RESEND_WEBHOOK_SECRET")
+
+
+def _verify_resend_signature(raw_body: bytes, headers) -> bool:
+    """Svix-style verification: the signing input is
+    '{svix-id}.{svix-timestamp}.{body}' and the signature header
+    carries one or more 'v1,<base64>' entries. Any match wins.
+    Returns False if the secret isn't set or any header is missing."""
+    if not RESEND_WEBHOOK_SECRET:
+        return False
+    svix_id = headers.get("svix-id")
+    svix_ts = headers.get("svix-timestamp")
+    svix_sig = headers.get("svix-signature")
+    if not (svix_id and svix_ts and svix_sig):
+        return False
+    secret = RESEND_WEBHOOK_SECRET
+    # Strip the 'whsec_' prefix Resend hands out, then base64-decode.
+    if secret.startswith("whsec_"):
+        secret = secret[len("whsec_"):]
+    try:
+        key = base64.b64decode(secret)
+    except Exception:
+        return False
+    signed_payload = f"{svix_id}.{svix_ts}.".encode() + raw_body
+    expected = base64.b64encode(
+        hmac.new(key, signed_payload, hashlib.sha256).digest()
+    ).decode()
+    # The header may contain multiple comma-separated 'v1,<sig>'
+    # entries (key rotation). Any match is enough.
+    for part in svix_sig.split():
+        for chunk in part.split(","):
+            if not chunk.startswith("v1,"):
+                continue
+            if hmac.compare_digest(chunk[len("v1,"):], expected):
+                return True
+    return False
+
+
+@app.post("/api/webhooks/resend")
+async def resend_webhook(request: Request):
+    raw = await request.body()
+    if not _verify_resend_signature(raw, request.headers):
+        raise HTTPException(status_code=401, detail="invalid signature")
+    try:
+        event = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+    event_type = event.get("type") or ""
+    data = event.get("data") or {}
+    message_id = data.get("email_id") or data.get("id")
+    # Resend's bounce events carry data.bounce.type ('Permanent' /
+    # 'Transient'). We only flip the flag for permanent bounces and
+    # spam complaints — soft bounces could be transient outages.
+    if not message_id:
+        return {"ok": True}
+    invalid = False
+    if event_type == "email.bounced":
+        bounce = data.get("bounce") or {}
+        if (bounce.get("type") or "").lower() == "permanent":
+            invalid = True
+    elif event_type == "email.complained":
+        invalid = True
+    if not invalid:
+        return {"ok": True}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "update contact_message set email_invalid = true "
+                    "where echo_message_id = %s",
+                    (message_id,),
+                )
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
     return {"ok": True}
 
 
