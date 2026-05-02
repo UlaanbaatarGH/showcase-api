@@ -643,6 +643,8 @@ def list_admin_projects(_user=Depends(current_user_required)):
     # (is_data_manager, is_user_manager) — the response surfaces both
     # lists separately so the projects table can render them in their
     # own columns.
+    # FIX351.2.1.6 <project-img-volume>: total image storage size per
+    # project in bytes, surfaced as Volume (Mbytes) in the table.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -658,6 +660,29 @@ def list_admin_projects(_user=Depends(current_user_required)):
                 "order by u.login_name"
             )
             access_rows = cur.fetchall()
+            # Aggregate image bytes per project. The inner CTE
+            # de-duplicates (project_id, image_id) pairs so an image
+            # linked to several folders of the same project counts
+            # exactly once.
+            cur.execute(
+                """
+                with proj_imgs as (
+                    select distinct f.project_id, i.storage_key
+                      from image i
+                      join folder_image fi on fi.image_id = i.id
+                      join folder f       on f.id = fi.folder_id
+                )
+                select pi.project_id,
+                       coalesce(sum((o.metadata->>'size')::bigint), 0) as bytes
+                  from proj_imgs pi
+                  left join storage.objects o
+                    on o.bucket_id = %s and o.name = pi.storage_key
+                 group by pi.project_id
+                """,
+                (SUPABASE_BUCKET,),
+            )
+            bytes_rows = cur.fetchall()
+    bytes_by_proj = {r["project_id"]: int(r["bytes"] or 0) for r in bytes_rows}
     data_by_proj = {}
     user_by_proj = {}
     for r in access_rows:
@@ -678,6 +703,7 @@ def list_admin_projects(_user=Depends(current_user_required)):
             ),
             "data_managers": data_by_proj.get(p["id"], []),
             "user_managers": user_by_proj.get(p["id"], []),
+            "image_bytes": bytes_by_proj.get(p["id"], 0),
         }
         for p in projects
     ]
