@@ -814,6 +814,15 @@ async def contact_admin(request: Request):
     subject = (payload.get("subject") or "").strip()
     message = (payload.get("message") or "").strip()
     email = (payload.get("email") or "").strip()
+    # FIX421.2.1.2: tag the message with the project context it was
+    # submitted from so <panel-message-list> can filter per project.
+    project_id_raw = payload.get("project_id")
+    project_id = None
+    if project_id_raw is not None:
+        try:
+            project_id = int(project_id_raw)
+        except (TypeError, ValueError):
+            project_id = None
     # FIX420.3.1.1: every field non-blank.
     if not subject:
         raise HTTPException(status_code=400, detail="subject required")
@@ -842,9 +851,10 @@ async def contact_admin(request: Request):
                         detail="please wait a minute before sending another message",
                     )
             cur.execute(
-                "insert into contact_message (ip, subject, body, sender_email) "
-                "values (%s, %s, %s, %s) returning id",
-                (ip, subject, message, email),
+                "insert into contact_message "
+                "(ip, subject, body, sender_email, project_id) "
+                "values (%s, %s, %s, %s, %s) returning id",
+                (ip, subject, message, email, project_id),
             )
             row_id = cur.fetchone()["id"]
         conn.commit()
@@ -950,6 +960,73 @@ async def resend_webhook(request: Request):
     except Exception:
         traceback.print_exc()
     return {"ok": True}
+
+
+# ============================================================
+# FIX421 <panel-message-list>: list of contact messages for the
+# admin / project managers. Optional ?project_id=N filter restricts
+# the list to one project (used when the panel is opened from a
+# project's Admin menu — FIX421.1).
+# ============================================================
+@app.get("/api/admin/messages")
+def list_contact_messages(
+    project_id: Optional[int] = None,
+    user=Depends(current_user_required),
+):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select profile from app_user where id = %s",
+                (user["id"],),
+            )
+            pr = cur.fetchone()
+            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            # Non-admin callers see only messages tied to projects
+            # they have any project_access row for.
+            allowed_ids = None
+            if not caller_is_admin:
+                cur.execute(
+                    "select project_id from project_access where user_id = %s",
+                    (user["id"],),
+                )
+                allowed_ids = [r["project_id"] for r in cur.fetchall()]
+                if not allowed_ids:
+                    return []
+            sql = (
+                "select m.id, m.ts, m.project_id, p.name as project_name, "
+                "       m.sender_email, m.subject, m.body, m.email_invalid "
+                "from contact_message m "
+                "left join project p on p.id = m.project_id "
+            )
+            params: list = []
+            where: list = []
+            if project_id is not None:
+                if not caller_is_admin and project_id not in allowed_ids:
+                    raise HTTPException(status_code=403, detail="forbidden")
+                where.append("m.project_id = %s")
+                params.append(project_id)
+            elif allowed_ids is not None:
+                where.append("m.project_id = any(%s)")
+                params.append(allowed_ids)
+            if where:
+                sql += "where " + " and ".join(where) + " "
+            # FIX421.2.1.10: descending Date/time.
+            sql += "order by m.ts desc limit 500"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r["id"],
+            "ts": r["ts"].isoformat(),
+            "project_id": r["project_id"],
+            "project_name": r["project_name"],
+            "sender_email": r["sender_email"],
+            "subject": r["subject"],
+            "body": r["body"],
+            "email_invalid": bool(r["email_invalid"]),
+        }
+        for r in rows
+    ]
 
 
 # ============================================================
