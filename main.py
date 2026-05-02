@@ -539,16 +539,21 @@ def _supabase_admin_create_user(email: str, password: str) -> dict:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 @app.post("/api/auth/redeem")
 async def redeem_account(request: Request):
-    """FIX317: redeem an access code to set the user's password.
-    Body: { name, access_code, password }. Caller is anonymous —
-    after success the frontend calls supabase.auth.signInWithPassword
-    with the same name + password to obtain a session."""
+    """FIX317 (Manager flow): redeem an access code to set the user's
+    password and email. Body: { name, access_code, password, email }.
+    Caller is anonymous — after success the frontend calls
+    supabase.auth.signInWithPassword with the same name + password to
+    obtain a session."""
     payload = await request.json() if await request.body() else {}
     name = (payload.get("name") or "").strip()
     code = (payload.get("access_code") or "").strip()
     password = payload.get("password") or ""
+    email = (payload.get("email") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name required")
     if not code:
@@ -560,6 +565,9 @@ async def redeem_account(request: Request):
             status_code=400,
             detail="password must be at least 8 characters",
         )
+    # FIX317.3.1.4: email shape check.
+    if not email or not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="email is not valid")
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -588,7 +596,8 @@ async def redeem_account(request: Request):
             # frontend's loginNameToEmail() (Supabase Auth normalises
             # to lowercase internally too — being explicit avoids any
             # surprise around what the auth row's email actually is).
-            # The Email column on the Users panel is administrative
+            # The user's real email goes onto app_user.email below;
+            # the Email column on the Users panel is administrative
             # metadata, not the auth identifier.
             synthetic_email = f"{name.lower()}@showcase.app"
             new_auth = _supabase_admin_create_user(synthetic_email, password)
@@ -599,11 +608,66 @@ async def redeem_account(request: Request):
                     detail="Supabase did not return a new user id",
                 )
             # FIX317.3.1.10: rewrite app_user.id to match the new
-            # Supabase auth id, clear the access code. ON UPDATE
-            # CASCADE on the FKs keeps project_access / visit linked.
+            # Supabase auth id, store the user-entered email, clear
+            # the access code. ON UPDATE CASCADE on the FKs keeps
+            # project_access / visit linked.
             cur.execute(
-                "update app_user set id = %s, access_code = null where id = %s",
-                (new_id, row["id"]),
+                "update app_user set id = %s, email = %s, access_code = null "
+                "where id = %s",
+                (new_id, email, row["id"]),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/auth/signup-visitor")
+async def signup_visitor(request: Request):
+    """FIX316.2.1 (Visitor flow): self-signup for a lambda visitor
+    account. No access code required. Body: { name, password, email }.
+    Creates a fresh app_user row with profile='visitor' and the
+    matching Supabase Auth row. The frontend signs in immediately
+    after."""
+    payload = await request.json() if await request.body() else {}
+    name = (payload.get("name") or "").strip()
+    password = payload.get("password") or ""
+    email = (payload.get("email") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="password must be at least 8 characters",
+        )
+    if not email or not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="email is not valid")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # Login name and email both stay unique (case-insensitive
+            # for name to match FIX315.5).
+            cur.execute(
+                "select 1 from app_user where lower(login_name) = lower(%s)",
+                (name,),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="name already in use")
+            cur.execute(
+                "select 1 from app_user where email = %s and email is not null",
+                (email,),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="email already in use")
+            synthetic_email = f"{name.lower()}@showcase.app"
+            new_auth = _supabase_admin_create_user(synthetic_email, password)
+            new_id = new_auth.get("id")
+            if not new_id:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Supabase did not return a new user id",
+                )
+            cur.execute(
+                "insert into app_user (id, login_name, email, profile) "
+                "values (%s, %s, %s, 'visitor')",
+                (new_id, name, email),
             )
         conn.commit()
     return {"ok": True}
