@@ -598,6 +598,19 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
     try:
         with urllib.request.urlopen(req, timeout=15):
             return
+    except urllib.error.HTTPError as e:
+        # Surface Resend's JSON error body so the admin can see the
+        # reason (free-tier domain restriction, invalid key, etc.)
+        # without digging into a generic 403 traceback.
+        body_text = ""
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(
+            f"[contact] Resend rejected the send: HTTP {e.code} "
+            f"to={contact_to!r} reply_to={sender_email!r} body={body_text!r}"
+        )
     except Exception:
         traceback.print_exc()
 
