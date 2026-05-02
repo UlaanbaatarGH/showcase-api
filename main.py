@@ -954,6 +954,7 @@ def _verify_resend_signature(raw_body: bytes, headers) -> bool:
 async def resend_webhook(request: Request):
     raw = await request.body()
     if not _verify_resend_signature(raw, request.headers):
+        print("[webhook] signature rejected")
         raise HTTPException(status_code=401, detail="invalid signature")
     try:
         event = json.loads(raw)
@@ -962,6 +963,7 @@ async def resend_webhook(request: Request):
     event_type = event.get("type") or ""
     data = event.get("data") or {}
     message_id = data.get("email_id") or data.get("id")
+    print(f"[webhook] event={event_type} message_id={message_id!r}")
     # Resend's bounce events carry data.bounce.type ('Permanent' /
     # 'Transient'). We only flip the flag for permanent bounces and
     # spam complaints — soft bounces could be transient outages.
@@ -989,7 +991,9 @@ async def resend_webhook(request: Request):
                     "where echo_message_id = %s",
                     (message_id,),
                 )
+                rowcount = cur.rowcount
             conn.commit()
+        print(f"[webhook] flagged {rowcount} row(s) for message_id={message_id!r}")
     except Exception:
         traceback.print_exc()
     return {"ok": True}
