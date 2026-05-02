@@ -625,6 +625,16 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
                 (name, primary, next_order),
             )
             row = cur.fetchone()
+            # FIX350.2.3.1: every project must have a root folder that is
+            # its Master Folder — properties hang off the folder, not the
+            # project. Migration 005 backfilled this for legacy projects;
+            # newly-created ones need it inserted here, otherwise the
+            # property editor errors out on first save.
+            cur.execute(
+                "insert into folder (project_id, name, sort_order, is_master) "
+                "values (%s, %s, 0, true)",
+                (row["id"], name),
+            )
             for mid in manager_ids:
                 cur.execute(
                     "insert into project_access "
@@ -1205,10 +1215,17 @@ def _save_setup_impl(payload):
             )
             master = cur.fetchone()
             if not master:
-                raise HTTPException(
-                    status_code=500,
-                    detail="project has no Master Folder; run migration 005",
+                # Self-heal: legacy projects created before the
+                # create_admin_project fix have no root folder. Create
+                # one now (mirrors migration 005 backfill) so Setup save
+                # works without the user having to run SQL.
+                cur.execute(
+                    "insert into folder (project_id, name, sort_order, is_master) "
+                    "select id, name, 0, true from project where id = %s "
+                    "returning id",
+                    (project_id,),
                 )
+                master = cur.fetchone()
             master_folder_id = master["id"]
 
             cur.execute(
