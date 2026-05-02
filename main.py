@@ -542,25 +542,46 @@ def _supabase_admin_create_user(email: str, password: str) -> dict:
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-# FIX420.3.1.3 transactional email — Resend is wired when these env
-# vars are set, otherwise the contact request is still recorded in
+# FIX420.3.1.3 transactional email — Resend is wired when this env
+# var is set, otherwise the contact request is still recorded in
 # the contact_message table and printed to the server log so admins
-# can recover it manually.
+# can recover it manually. Recipient lives in the app_setting table
+# (key='contact_to') per FIX420.3.1.3 — env var CONTACT_TO is kept
+# as a fallback for local dev / pre-migration deployments.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
-CONTACT_TO = os.environ.get("CONTACT_TO")
+CONTACT_TO_FALLBACK = os.environ.get("CONTACT_TO")
+
+
+def _resolve_contact_to() -> Optional[str]:
+    """Read the configured recipient from app_setting.contact_to,
+    falling back to the CONTACT_TO env var if the table or row is
+    not present yet."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "select value from app_setting where key = 'contact_to'"
+                )
+                row = cur.fetchone()
+                if row and row["value"]:
+                    return row["value"].strip()
+    except Exception:
+        traceback.print_exc()
+    return CONTACT_TO_FALLBACK
 
 
 def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
     """Best-effort Resend send. Failures are swallowed so a Resend
     outage doesn't drop the user's message — the row is already in
     contact_message and the admin can pick it up from there."""
-    if not RESEND_API_KEY or not CONTACT_TO:
+    contact_to = _resolve_contact_to()
+    if not RESEND_API_KEY or not contact_to:
         print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
         return
     body = json.dumps({
         "from": RESEND_FROM,
-        "to": [CONTACT_TO],
+        "to": [contact_to],
         "reply_to": sender_email,
         "subject": subject,
         "text": f"Sender: {sender_email}\n\n{message}",
@@ -786,10 +807,7 @@ def _check_managers_have_password(cur, manager_ids):
 
 
 @app.get("/api/admin/projects")
-def list_admin_projects(_user=Depends(current_user_required)):
-    # Spec FIX351 doesn't restrict reading the project list; only the
-    # write actions (add, rename, swap managers, clear managers, move)
-    # are admin-only and stay guarded by current_admin_required.
+def list_admin_projects(user=Depends(current_user_required)):
     # FIX400.2.1.1: order matches the panel's stored sort order.
     # FIX351.2.1.2 / .1.5: a project_access row carries two roles
     # (is_data_manager, is_user_manager) — the response surfaces both
@@ -797,12 +815,32 @@ def list_admin_projects(_user=Depends(current_user_required)):
     # own columns.
     # FIX351.2.1.6 <project-img-volume>: total image storage size per
     # project in bytes, surfaced as Volume (Mbytes) in the table.
+    # FIX351.5.8: non-admin callers see only the projects where they
+    # appear as data manager or user manager. Admins see every row.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select id, name, is_public, sort_order "
-                "from project order by sort_order, id"
+                "select profile from app_user where id = %s",
+                (user["id"],),
             )
+            pr = cur.fetchone()
+            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            if caller_is_admin:
+                cur.execute(
+                    "select id, name, is_public, sort_order "
+                    "from project order by sort_order, id"
+                )
+            else:
+                cur.execute(
+                    "select p.id, p.name, p.is_public, p.sort_order "
+                    "from project p "
+                    "join project_access pa on pa.project_id = p.id "
+                    "where pa.user_id = %s "
+                    "  and (pa.is_data_manager or pa.is_user_manager) "
+                    "group by p.id "
+                    "order by p.sort_order, p.id",
+                    (user["id"],),
+                )
             projects = cur.fetchall()
             cur.execute(
                 "select pa.project_id, pa.user_id, u.login_name, "
