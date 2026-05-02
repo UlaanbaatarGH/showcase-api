@@ -862,6 +862,10 @@ async def update_admin_project(
             # the project_access rows for this project from the union
             # of (data_managers, user_managers); each row carries both
             # role flags as appropriate.
+            # Note: no `password set` precondition here — under the
+            # new flow grant_user_project legitimately adds users that
+            # haven't redeemed yet (FIX317). They appear as data
+            # managers but can't act as managers until they redeem.
             if data_managers is not None or user_managers is not None or legacy_managers is not None:
                 if legacy_managers is not None:
                     data_set = set(legacy_managers or [])
@@ -870,7 +874,6 @@ async def update_admin_project(
                     data_set = set(data_managers or [])
                     user_set = set(user_managers or [])
                 all_set = data_set | user_set
-                _check_managers_have_password(cur, list(all_set))
                 cur.execute(
                     "delete from project_access where project_id = %s",
                     (project_id,),
