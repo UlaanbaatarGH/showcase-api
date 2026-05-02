@@ -550,6 +550,11 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # as a fallback for local dev / pre-migration deployments.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+# Optional acknowledgement-echo: when set (typically once the domain
+# is verified in Resend), every contact submission also fires a
+# no-reply confirmation back to the sender. Leaving it unset keeps
+# the feature dormant — the admin email still goes out either way.
+RESEND_NOREPLY_FROM = os.environ.get("RESEND_NOREPLY_FROM")
 CONTACT_TO_FALLBACK = os.environ.get("CONTACT_TO")
 
 
@@ -571,21 +576,11 @@ def _resolve_contact_to() -> Optional[str]:
     return CONTACT_TO_FALLBACK
 
 
-def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
-    """Best-effort Resend send. Failures are swallowed so a Resend
-    outage doesn't drop the user's message — the row is already in
-    contact_message and the admin can pick it up from there."""
-    contact_to = _resolve_contact_to()
-    if not RESEND_API_KEY or not contact_to:
-        print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
-        return
-    body = json.dumps({
-        "from": RESEND_FROM,
-        "to": [contact_to],
-        "reply_to": sender_email,
-        "subject": subject,
-        "text": f"Sender: {sender_email}\n\n{message}",
-    }).encode()
+def _resend_send(payload: dict, *, label: str) -> bool:
+    """Internal Resend POST wrapper. Surfaces Resend's JSON error
+    body in the log so the admin can diagnose without parsing a
+    Python traceback. Returns True on success."""
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=body,
@@ -602,22 +597,67 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=15):
-            return
+            return True
     except urllib.error.HTTPError as e:
-        # Surface Resend's JSON error body so the admin can see the
-        # reason (free-tier domain restriction, invalid key, etc.)
-        # without digging into a generic 403 traceback.
         body_text = ""
         try:
             body_text = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
         print(
-            f"[contact] Resend rejected the send: HTTP {e.code} "
-            f"to={contact_to!r} reply_to={sender_email!r} body={body_text!r}"
+            f"[contact] {label} rejected by Resend: HTTP {e.code} "
+            f"to={payload.get('to')!r} body={body_text!r}"
         )
     except Exception:
         traceback.print_exc()
+    return False
+
+
+def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
+    """Best-effort Resend send. Failures are swallowed so a Resend
+    outage doesn't drop the user's message — the row is already in
+    contact_message and the admin can pick it up from there."""
+    contact_to = _resolve_contact_to()
+    if not RESEND_API_KEY or not contact_to:
+        print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
+        return
+    # 1) Forward the message to the admin inbox.
+    _resend_send(
+        {
+            "from": RESEND_FROM,
+            "to": [contact_to],
+            "reply_to": sender_email,
+            "subject": subject,
+            "text": f"Sender: {sender_email}\n\n{message}",
+        },
+        label="admin forward",
+    )
+    # 2) Optional no-reply echo to the sender, gated on
+    # RESEND_NOREPLY_FROM being configured (which presumes the
+    # domain is verified in Resend so arbitrary recipients are
+    # reachable). Until then this stays dormant.
+    if RESEND_NOREPLY_FROM:
+        echo_body = (
+            "Thanks for your message — we've received it and will "
+            "get back to you soon.\n"
+            "\n"
+            "(This is an automated acknowledgement; please do not "
+            "reply to this address.)\n"
+            "\n"
+            "----- Your message -----\n"
+            f"Subject: {subject}\n"
+            "\n"
+            f"{message}\n"
+        )
+        _resend_send(
+            {
+                "from": RESEND_NOREPLY_FROM,
+                "to": [sender_email],
+                "subject": f"Re: {subject}",
+                "text": echo_body,
+            },
+            label="sender echo",
+        )
 
 
 @app.post("/api/auth/redeem")
