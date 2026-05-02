@@ -1168,15 +1168,20 @@ def list_projects(user=Depends(current_user_optional)):
                         "order by p.sort_order, p.id"
                     )
                 else:
+                    # Use EXISTS instead of LEFT JOIN + DISTINCT — the
+                    # join would otherwise produce one row per project
+                    # access entry, and Postgres rejects ORDER BY on
+                    # a column that isn't in a SELECT DISTINCT list.
                     cur.execute(
-                        "select distinct p.id, p.name, p.cover_image_key, p.is_public, "
+                        "select p.id, p.name, p.cover_image_key, p.is_public, "
                         "       (p.owner_id = %s or p.owner_id is null) as can_edit "
                         "from project p "
-                        "left join project_access pa "
-                        "       on pa.project_id = p.id and pa.user_id = %s "
                         "where p.is_public "
-                        "   or pa.user_id is not null "
                         "   or p.owner_id = %s "
+                        "   or exists ("
+                        "     select 1 from project_access pa "
+                        "     where pa.project_id = p.id and pa.user_id = %s"
+                        "   ) "
                         "order by p.sort_order, p.id",
                         (user["id"], user["id"], user["id"]),
                     )
