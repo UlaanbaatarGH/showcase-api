@@ -377,15 +377,18 @@ def get_ip_stats(_user=Depends(current_user_required)):
 # app_user rows with their flags + project-access summary, lets
 # the admin add (FIX311.3.1) or remove (FIX311.3.2) users.
 # ============================================================
-def _user_row_to_dict(row, projects):
+def _user_row_to_dict(row, projects, see_sensitive=True):
     # FIX311.2.1.6 <user-projects>: projects is a list of {id, name}
     # so the frontend can target rows by id when editing the column
     # (FIX311.3.3) and not just display the names.
+    # FIX311.5.9: <user-email> and <user-access-code> are masked when
+    # the caller may not see them (PM with no shared project, etc.) —
+    # defence-in-depth on top of the UI gate.
     return {
         "id": str(row["id"]),
         "name": row["login_name"],
-        "email": row["email"],
-        "access_code": row["access_code"],
+        "email": row["email"] if see_sensitive else None,
+        "access_code": row["access_code"] if see_sensitive else None,
         "is_admin": row["profile"] == "admin",
         "has_password": bool(row.get("has_password")),
         "projects": projects,
@@ -393,13 +396,24 @@ def _user_row_to_dict(row, projects):
 
 
 @app.get("/api/admin/users")
-def list_users(_user=Depends(current_user_required)):
+def list_users(user=Depends(current_user_required)):
     # Per FIX311.5.{2..5}, only the editing affordances (add, remove,
     # rename, change email) are admin-only. The list itself is
     # visible to every signed-in user — they just see it read-only,
     # which the frontend enforces by hiding the toolbar.
+    # FIX311.5.9: per-row gate on email + access_code — an admin sees
+    # everything, a project manager sees them only for users that
+    # have at least one project in common with the manager.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            pr = cur.fetchone()
+            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            cur.execute(
+                "select project_id from project_access where user_id = %s",
+                (user["id"],),
+            )
+            caller_managed = {r["project_id"] for r in cur.fetchall()}
             # FIX311.2.1.3.1: 'has_password' is true when the linked
             # Supabase auth.users row has an encrypted_password set.
             # Admin-created users without a Supabase Auth row stay
@@ -424,7 +438,15 @@ def list_users(_user=Depends(current_user_required)):
         by_user.setdefault(str(r["user_id"]), []).append(
             {"id": r["id"], "name": r["name"]}
         )
-    return [_user_row_to_dict(u, by_user.get(str(u["id"]), [])) for u in users]
+    out = []
+    for u in users:
+        projects_for = by_user.get(str(u["id"]), [])
+        if caller_is_admin:
+            see_sensitive = True
+        else:
+            see_sensitive = any(p["id"] in caller_managed for p in projects_for)
+        out.append(_user_row_to_dict(u, projects_for, see_sensitive))
+    return out
 
 
 @app.post("/api/admin/users")
