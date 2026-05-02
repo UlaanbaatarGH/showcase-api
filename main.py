@@ -593,6 +593,11 @@ def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            # Cloudflare in front of api.resend.com 403s (error 1010)
+            # the default Python-urllib User-Agent. A neutral UA gets
+            # the request through.
+            "User-Agent": "showcase-api/1.0",
+            "Accept": "application/json",
         },
     )
     try:
