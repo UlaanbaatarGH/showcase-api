@@ -601,7 +601,9 @@ def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
+            parsed = json.loads(resp.read())
+            print(f"[contact] {label} Resend response: {parsed!r}")
+            return parsed
     except urllib.error.HTTPError as e:
         body_text = ""
         try:
@@ -953,8 +955,21 @@ def _verify_resend_signature(raw_body: bytes, headers) -> bool:
 @app.post("/api/webhooks/resend")
 async def resend_webhook(request: Request):
     raw = await request.body()
+    # Trace the bare delivery attempt so we know Resend reached us
+    # at all, and what shape the payload has.
+    snippet = raw[:500].decode("utf-8", errors="replace")
+    svix_id = request.headers.get("svix-id")
+    svix_ts = request.headers.get("svix-timestamp")
+    svix_sig = request.headers.get("svix-signature")
+    print(
+        f"[webhook] received len={len(raw)} svix_id={svix_id!r} "
+        f"svix_ts={svix_ts!r} svix_sig={svix_sig!r} body[:500]={snippet!r}"
+    )
     if not _verify_resend_signature(raw, request.headers):
-        print("[webhook] signature rejected")
+        print(
+            "[webhook] signature rejected — "
+            f"secret_set={bool(RESEND_WEBHOOK_SECRET)}"
+        )
         raise HTTPException(status_code=401, detail="invalid signature")
     try:
         event = json.loads(raw)
@@ -963,7 +978,10 @@ async def resend_webhook(request: Request):
     event_type = event.get("type") or ""
     data = event.get("data") or {}
     message_id = data.get("email_id") or data.get("id")
-    print(f"[webhook] event={event_type} message_id={message_id!r}")
+    print(
+        f"[webhook] parsed event={event_type!r} message_id={message_id!r} "
+        f"data_keys={list(data.keys())!r}"
+    )
     # Resend's bounce events carry data.bounce.type ('Permanent' /
     # 'Transient'). We only flip the flag for permanent bounces and
     # spam complaints — soft bounces could be transient outages.
