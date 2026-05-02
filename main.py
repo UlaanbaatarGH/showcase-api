@@ -1081,11 +1081,14 @@ def _slugify_name(name: str) -> str:
 
 
 @app.get("/api/showcase")
-def showcase(slug: Optional[str] = None):
+def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
     """FIX401.2: scoped to one project. With ?slug= the route resolves
     that specific project; without it (legacy callers) we still pick
     the first project in panel order so old single-project clients
-    keep working."""
+    keep working.
+    FIX503.5.1: also surfaces an `is_admin_or_manager` flag so the
+    Showcase header can hide admin-only affordances (Import menu,
+    Grouping, Setup, Admin menu) from anonymous and non-manager users."""
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if slug:
@@ -1115,6 +1118,24 @@ def showcase(slug: Optional[str] = None):
                     "view_setup": {},
                     "folders": [],
                 }
+            # FIX503.5.1: caller is admin (global role) or manager
+            # (project_access row for this project).
+            is_admin_or_manager = False
+            if user is not None:
+                cur.execute(
+                    "select profile from app_user where id = %s",
+                    (user["id"],),
+                )
+                pr = cur.fetchone()
+                if pr and pr["profile"] == "admin":
+                    is_admin_or_manager = True
+                else:
+                    cur.execute(
+                        "select 1 from project_access "
+                        "where project_id = %s and user_id = %s",
+                        (project["id"], user["id"]),
+                    )
+                    is_admin_or_manager = cur.fetchone() is not None
             # FIX350.2.3.1: property list lives on Master Folder, not project.
             # A project can have several Master Folders (FIX350.2.3.3); we union
             # their properties here for the showcase view.
@@ -1164,7 +1185,11 @@ def showcase(slug: Optional[str] = None):
         for r in rows
     ]
     return {
-        "project": {"id": project["id"], "name": project["name"]},
+        "project": {
+            "id": project["id"],
+            "name": project["name"],
+            "is_admin_or_manager": is_admin_or_manager,
+        },
         "properties": properties,
         "view_setup": project["view_setup"] or {},
         "folders": folders,
