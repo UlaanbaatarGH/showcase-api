@@ -1289,12 +1289,25 @@ def _save_setup_impl(payload):
                         params,
                     )
                 else:
+                    # FIX350.2.2.2.1.1 / .1.1.1: allocate a project-local
+                    # id of the form project_id*1000 + N. We pick the
+                    # next slot above the project's current max so the
+                    # displayed id (= id mod 1000) keeps climbing.
+                    cur.execute(
+                        "select coalesce(max(p.id), %s * 1000) + 1 as next_id "
+                        "from property p "
+                        "join folder f on f.id = p.master_folder_id "
+                        "where f.project_id = %s",
+                        (project_id, project_id),
+                    )
+                    next_id = cur.fetchone()["next_id"]
                     cur.execute(
                         "insert into property "
-                        "  (master_folder_id, label, short_label, formula, "
+                        "  (id, master_folder_id, label, short_label, formula, "
                         "   trailing_values, accepted_value_set, sort_order) "
-                        "values (%s, %s, %s, %s, %s, %s, %s) returning id",
+                        "values (%s, %s, %s, %s, %s, %s, %s, %s) returning id",
                         (
+                            next_id,
                             master_folder_id,
                             label,
                             short_label,
@@ -1439,10 +1452,20 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates
                     short_label = None
                 if not label:
                     continue
+                # FIX350.2.2.2.1.1 / .1.1.1: project-local id allocation
+                # (see /api/setup for the rationale).
                 cur.execute(
-                    "insert into property (master_folder_id, label, short_label, sort_order) "
-                    "values (%s, %s, %s, %s) returning id",
-                    (master_folder_id, label, short_label, next_sort),
+                    "select coalesce(max(p.id), %s * 1000) + 1 as next_id "
+                    "from property p "
+                    "join folder f on f.id = p.master_folder_id "
+                    "where f.project_id = %s",
+                    (project_id, project_id),
+                )
+                next_id = cur.fetchone()["next_id"]
+                cur.execute(
+                    "insert into property (id, master_folder_id, label, short_label, sort_order) "
+                    "values (%s, %s, %s, %s, %s) returning id",
+                    (next_id, master_folder_id, label, short_label, next_sort),
                 )
                 new_prop_ids[label] = cur.fetchone()["id"]
                 next_sort += 1
