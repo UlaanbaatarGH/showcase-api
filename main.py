@@ -181,8 +181,21 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
                 (user["id"], login_name),
             )
             row = cur.fetchone()
+            row["managed_project_ids"] = _managed_project_ids(cur, user["id"])
         conn.commit()
     return row
+
+
+def _managed_project_ids(cur, user_id) -> list:
+    # FIX311.5.6 / FIX351.2.x: list of project ids the caller has a
+    # project_access row for. Frontend uses this to know if the caller
+    # is a Project Manager (and of which projects), so it can filter
+    # the projects available in the user-projects editor.
+    cur.execute(
+        "select project_id from project_access where user_id = %s",
+        (user_id,),
+    )
+    return [r["project_id"] for r in cur.fetchall()]
 
 
 @app.get("/api/users/me")
@@ -195,6 +208,8 @@ def get_me(user=Depends(current_user_required)):
                 (user["id"],),
             )
             row = cur.fetchone()
+            if row is not None:
+                row["managed_project_ids"] = _managed_project_ids(cur, user["id"])
     if not row:
         raise HTTPException(status_code=404, detail="user row not created yet")
     return row
@@ -342,6 +357,9 @@ def get_ip_stats(_user=Depends(current_user_required)):
 # the admin add (FIX311.3.1) or remove (FIX311.3.2) users.
 # ============================================================
 def _user_row_to_dict(row, projects):
+    # FIX311.2.1.6 <user-projects>: projects is a list of {id, name}
+    # so the frontend can target rows by id when editing the column
+    # (FIX311.3.3) and not just display the names.
     return {
         "id": str(row["id"]),
         "name": row["login_name"],
@@ -374,15 +392,17 @@ def list_users(_user=Depends(current_user_required)):
             )
             users = cur.fetchall()
             cur.execute(
-                "select pa.user_id, p.name "
+                "select pa.user_id, p.id, p.name "
                 "from project_access pa "
                 "join project p on p.id = pa.project_id "
-                "order by p.id"
+                "order by p.sort_order, p.id"
             )
             access_rows = cur.fetchall()
     by_user = {}
     for r in access_rows:
-        by_user.setdefault(str(r["user_id"]), []).append(r["name"])
+        by_user.setdefault(str(r["user_id"]), []).append(
+            {"id": r["id"], "name": r["name"]}
+        )
     return [_user_row_to_dict(u, by_user.get(str(u["id"]), [])) for u in users]
 
 
@@ -606,20 +626,20 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
     # FIX351.2.1.1: non-blank, unique name.
     if not name:
         raise HTTPException(status_code=400, detail="name required")
-    # FIX351.2.1.2: at least one manager with password set.
-    if not manager_ids:
-        raise HTTPException(status_code=400, detail="at least one manager required")
+    # FIX351.2.1.2 (removed): managers can now be assigned later via
+    # the user-projects editor (FIX311.3.3) — Add Project no longer
+    # demands at least one manager.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select 1 from project where name = %s", (name,))
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="project name already in use")
             _check_managers_have_password(cur, manager_ids)
-            # First manager becomes owner_id; the rest get
+            # First manager (if any) becomes owner_id; the rest get
             # project_access rows. FIX351.2.1.3.1 + FIX400.2.1.{2,3}:
             # new projects are private by default — admin must flip
             # is_public on for them to appear to anyone.
-            primary = manager_ids[0]
+            primary = manager_ids[0] if manager_ids else None
             # Append at the end of the order list (FIX351.2.7/.2.8).
             cur.execute(
                 "select coalesce(max(sort_order), 0) + 10 as next "
@@ -836,6 +856,8 @@ async def update_user(
 
 @app.delete("/api/admin/users/{user_id}")
 def delete_user(user_id: str, admin=Depends(current_admin_required)):
+    # FIX311.5.8: project_access has on-delete-cascade on user_id, so
+    # removing the app_user row also clears every manager assignment.
     if user_id == admin["id"]:
         raise HTTPException(status_code=400, detail="cannot remove yourself")
     with pool.connection() as conn:
@@ -845,6 +867,77 @@ def delete_user(user_id: str, admin=Depends(current_admin_required)):
         conn.commit()
     if removed == 0:
         raise HTTPException(status_code=404, detail="user not found")
+    return {"ok": True}
+
+
+def _require_admin_or_manager_of(cur, caller_id: str, project_id: int) -> None:
+    """FIX311.5.6 / FIX351.2.x: editing a user's <user-projects> entry
+    for project P is allowed when the caller is a global admin OR has
+    a project_access row for P (= is a Project Manager of P)."""
+    cur.execute("select profile from app_user where id = %s", (caller_id,))
+    pr = cur.fetchone()
+    if pr and pr["profile"] == "admin":
+        return
+    cur.execute(
+        "select 1 from project_access where user_id = %s and project_id = %s",
+        (caller_id, project_id),
+    )
+    if not cur.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail="must be admin or a manager of this project",
+        )
+
+
+@app.post("/api/admin/users/{user_id}/projects/{project_id}")
+def grant_user_project(
+    user_id: str,
+    project_id: int,
+    caller=Depends(current_user_required),
+):
+    """FIX311.3.3 + FIX311.5.6: link `user_id` to `project_id` by
+    inserting a project_access row (= adds the project to the user's
+    <user-projects>). Idempotent: re-granting an existing row is a
+    no-op."""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _require_admin_or_manager_of(cur, caller["id"], project_id)
+            cur.execute("select 1 from app_user where id = %s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="user not found")
+            cur.execute("select 1 from project where id = %s", (project_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="project not found")
+            cur.execute(
+                "insert into project_access "
+                "(user_id, project_id, group2_rights, group3_rights) "
+                "values (%s, %s, 'CRUD', 'CRUD') "
+                "on conflict (user_id, project_id) do nothing",
+                (user_id, project_id),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{user_id}/projects/{project_id}")
+def revoke_user_project(
+    user_id: str,
+    project_id: int,
+    caller=Depends(current_user_required),
+):
+    """FIX311.3.3 + FIX311.5.6 + FIX311.5.7: unlink `user_id` from
+    `project_id`. Removes the project_access row, which is the same
+    storage behind <user-projects> and <project-managers>, so the
+    user is implicitly removed from the project's managers too."""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _require_admin_or_manager_of(cur, caller["id"], project_id)
+            cur.execute(
+                "delete from project_access "
+                "where user_id = %s and project_id = %s",
+                (user_id, project_id),
+            )
+        conn.commit()
     return {"ok": True}
 
 
