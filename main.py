@@ -941,14 +941,16 @@ def _verify_resend_signature(raw_body: bytes, headers) -> bool:
     expected = base64.b64encode(
         hmac.new(key, signed_payload, hashlib.sha256).digest()
     ).decode()
-    # The header may contain multiple comma-separated 'v1,<sig>'
-    # entries (key rotation). Any match is enough.
+    # The header carries one or more space-separated 'v1,<sig>'
+    # entries (key rotation can produce several). For each entry
+    # the comma separates the version label from the signature
+    # itself. Any match is enough.
     for part in svix_sig.split():
-        for chunk in part.split(","):
-            if not chunk.startswith("v1,"):
-                continue
-            if hmac.compare_digest(chunk[len("v1,"):], expected):
-                return True
+        version, _, sig = part.partition(",")
+        if version != "v1" or not sig:
+            continue
+        if hmac.compare_digest(sig, expected):
+            return True
     return False
 
 
