@@ -931,12 +931,19 @@ def _verify_resend_signature(raw_body: bytes, headers) -> bool:
         return False
     secret = RESEND_WEBHOOK_SECRET
     # Strip the 'whsec_' prefix Resend hands out, then base64-decode.
+    # Be liberal with the alphabet (URL-safe -/_ are allowed) and
+    # missing '=' padding — both are common for whsec_ secrets.
     if secret.startswith("whsec_"):
         secret = secret[len("whsec_"):]
+    padded = secret + "=" * (-len(secret) % 4)
     try:
-        key = base64.b64decode(secret)
+        key = base64.urlsafe_b64decode(padded)
     except Exception:
-        return False
+        try:
+            key = base64.b64decode(padded)
+        except Exception as e:
+            print(f"[webhook] secret base64 decode failed: {e!r}")
+            return False
     signed_payload = f"{svix_id}.{svix_ts}.".encode() + raw_body
     expected = base64.b64encode(
         hmac.new(key, signed_payload, hashlib.sha256).digest()
@@ -945,12 +952,18 @@ def _verify_resend_signature(raw_body: bytes, headers) -> bool:
     # entries (key rotation can produce several). For each entry
     # the comma separates the version label from the signature
     # itself. Any match is enough.
+    received: list = []
     for part in svix_sig.split():
         version, _, sig = part.partition(",")
         if version != "v1" or not sig:
             continue
+        received.append(sig)
         if hmac.compare_digest(sig, expected):
             return True
+    print(
+        f"[webhook] signature mismatch — expected={expected!r} "
+        f"received={received!r} key_len={len(key)}"
+    )
     return False
 
 
