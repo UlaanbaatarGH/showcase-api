@@ -974,6 +974,11 @@ async def resend_webhook(request: Request):
             invalid = True
     elif event_type == "email.complained":
         invalid = True
+    elif event_type == "email.suppressed":
+        # Resend put the address on its suppression list (typically
+        # after a previous hard bounce or complaint). Same signal as
+        # 'do not bother replying'.
+        invalid = True
     if not invalid:
         return {"ok": True}
     try:
