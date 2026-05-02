@@ -542,6 +542,45 @@ def _supabase_admin_create_user(email: str, password: str) -> dict:
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+# FIX420.3.1.3 transactional email — Resend is wired when these env
+# vars are set, otherwise the contact request is still recorded in
+# the contact_message table and printed to the server log so admins
+# can recover it manually.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+CONTACT_TO = os.environ.get("CONTACT_TO")
+
+
+def _send_contact_email(subject: str, message: str, sender_email: str) -> None:
+    """Best-effort Resend send. Failures are swallowed so a Resend
+    outage doesn't drop the user's message — the row is already in
+    contact_message and the admin can pick it up from there."""
+    if not RESEND_API_KEY or not CONTACT_TO:
+        print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
+        return
+    body = json.dumps({
+        "from": RESEND_FROM,
+        "to": [CONTACT_TO],
+        "reply_to": sender_email,
+        "subject": subject,
+        "text": f"Sender: {sender_email}\n\n{message}",
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            return
+    except Exception:
+        traceback.print_exc()
+
+
 @app.post("/api/auth/redeem")
 async def redeem_account(request: Request):
     """FIX317 (Manager flow): redeem an access code to set the user's
@@ -670,6 +709,55 @@ async def signup_visitor(request: Request):
                 (new_id, name, email),
             )
         conn.commit()
+    return {"ok": True}
+
+
+# ============================================================
+# FIX420 <panel-contact-admin>: anonymous Contact form. Stores the
+# message in contact_message and forwards it to a configured admin
+# inbox via Resend (FIX420.3.1.3). Rate-limited to once per minute
+# per IP (FIX420.4.1).
+# ============================================================
+@app.post("/api/contact")
+async def contact_admin(request: Request):
+    payload = await request.json() if await request.body() else {}
+    subject = (payload.get("subject") or "").strip()
+    message = (payload.get("message") or "").strip()
+    email = (payload.get("email") or "").strip()
+    # FIX420.3.1.1: every field non-blank.
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    # FIX420.3.1.2: email shape check.
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="email is not valid")
+    ip = _client_ip(request)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # FIX420.4.1: 1-minute cooldown per IP. Same generic 429
+            # for any IP that posted recently.
+            if ip is not None:
+                cur.execute(
+                    "select 1 from contact_message "
+                    "where ip = %s and ts > now() - interval '60 seconds' "
+                    "limit 1",
+                    (ip,),
+                )
+                if cur.fetchone():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="please wait a minute before sending another message",
+                    )
+            cur.execute(
+                "insert into contact_message (ip, subject, body, sender_email) "
+                "values (%s, %s, %s, %s)",
+                (ip, subject, message, email),
+            )
+        conn.commit()
+    _send_contact_email(subject, message, email)
     return {"ok": True}
 
 
