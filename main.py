@@ -252,12 +252,21 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
     # User column can display it even when the attempt failed (and
     # therefore has no app_user join). Only meaningful for login rows.
     typed_login = (payload.get("login_name") or "").strip() or None
+    # FIX412.2.1.1.1: 'project' visits carry the project id so the
+    # Page column can render the project's name. Ignored for other
+    # page types.
+    project_id = payload.get("project_id") if page == "project" else None
+    if project_id is not None:
+        try:
+            project_id = int(project_id)
+        except (TypeError, ValueError):
+            project_id = None
     # FIX412.5.1: every sign-in attempt is recorded, no dedup — failed
     # then succeeded within seconds is a legitimate sequence the admin
     # needs to see distinctly. For 'home' / 'project' page hits, keep
-    # the soft 30s dedup on (ip, page, user_id) so a refresh / React
-    # StrictMode double-mount doesn't double-log, but a sign-in inside
-    # the same window still produces a fresh row (different user_id).
+    # the soft 30s dedup on (ip, page, user_id, project_id) so a
+    # refresh / React StrictMode double-mount doesn't double-log, but
+    # a sign-in inside the same window still produces a fresh row.
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -269,16 +278,17 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
                     )
                 else:
                     cur.execute(
-                        "insert into visit (user_id, ip, page) "
-                        "select %s, %s, %s "
+                        "insert into visit (user_id, ip, page, project_id) "
+                        "select %s, %s, %s, %s "
                         "where not exists ("
                         "  select 1 from visit "
                         "  where ip is not distinct from %s "
                         "    and page = %s "
                         "    and user_id is not distinct from %s "
+                        "    and project_id is not distinct from %s "
                         "    and ts > now() - interval '30 seconds'"
                         ")",
-                        (user_id, ip, page, ip, page, user_id),
+                        (user_id, ip, page, project_id, ip, page, user_id, project_id),
                     )
             conn.commit()
     except Exception:
@@ -288,12 +298,17 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
 
 @app.get("/api/admin/visits")
 def list_visits(_user=Depends(current_user_required)):
+    # FIX412.2.1.1.1: include the project's name when the visit row
+    # is tagged with project_id so the History tab can render
+    # '{project-name}' in the Page column.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select u.login_name, v.ip, v.page, v.ts, v.typed_login "
+                "select u.login_name, v.ip, v.page, v.ts, v.typed_login, "
+                "       p.name as project_name "
                 "from visit v "
                 "left join app_user u on u.id = v.user_id "
+                "left join project  p on p.id = v.project_id "
                 "order by v.ts desc "
                 "limit 200"
             )
@@ -305,6 +320,7 @@ def list_visits(_user=Depends(current_user_required)):
             "page": r["page"],
             "ts": r["ts"].isoformat(),
             "typed_login": r["typed_login"],
+            "project_name": r["project_name"],
         }
         for r in rows
     ]
@@ -345,6 +361,11 @@ def get_ip_stats(_user=Depends(current_user_required)):
                 "home_count": int(r["home_count"] or 0),
                 "project_count": int(r["project_count"] or 0),
                 "login_count": int(r["login_count"] or 0),
+                # FIX413.2.1.6 <ip-action-when>: timestamp of the IP's
+                # most recent tracked action — login, home or project
+                # visit. The SQL already orders rows by this descending
+                # (FIX413.5.1).
+                "last_ts": r["last_ts"].isoformat() if r["last_ts"] else None,
             }
             for r in rows
         ],
