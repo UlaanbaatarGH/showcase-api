@@ -1163,13 +1163,15 @@ def list_admin_projects(user=Depends(current_user_required)):
             if caller_is_admin:
                 cur.execute(
                     "select id, name, is_public, sort_order, "
-                    "       front_introduction, introduction "
+                    "       front_introduction, introduction, "
+                    "       title_text, title_size, title_colour, title_is_bold "
                     "from project order by sort_order, id"
                 )
             else:
                 cur.execute(
                     "select p.id, p.name, p.is_public, p.sort_order, "
-                    "       p.front_introduction, p.introduction "
+                    "       p.front_introduction, p.introduction, "
+                    "       p.title_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
                     "join project_access pa on pa.project_id = p.id "
                     "where pa.user_id = %s "
@@ -1248,6 +1250,12 @@ def list_admin_projects(user=Depends(current_user_required)):
             "front_introduction": p.get("front_introduction") or "",
             "introduction": p.get("introduction") or "",
             "slugs": slugs_by_proj.get(p["id"], []),
+            # FIX352.2.7 <project-title>: optional decorative label
+            # rendered in the project page header.
+            "title_text": p.get("title_text") or "",
+            "title_size": p.get("title_size"),
+            "title_colour": p.get("title_colour"),
+            "title_is_bold": bool(p.get("title_is_bold")),
         }
         for p in projects
     ]
@@ -1350,6 +1358,14 @@ async def update_admin_project(
     introduction = payload.get("introduction")
     # FIX352.2.10 / FIX352.3.{2,3,4}: editable slug list.
     slugs = payload.get("slugs")  # list of {label, is_official, is_active} or None
+    # FIX352.2.7 <project-title>: optional decorative label + style.
+    # `null` clears the optional ones (size, colour); use empty
+    # string to clear title_text. Each is independently skip-able by
+    # omitting the key.
+    has_title_text = "title_text" in payload
+    has_title_size = "title_size" in payload
+    has_title_colour = "title_colour" in payload
+    has_title_is_bold = "title_is_bold" in payload
     # Backward compat: legacy clients send 'managers' meaning both
     # roles at once — treat the list as both data + user managers so
     # the row state matches the pre-split semantics.
@@ -1445,6 +1461,50 @@ async def update_admin_project(
                 cur.execute(
                     "update project set introduction = %s where id = %s",
                     (str(introduction), project_id),
+                )
+            # FIX352.2.7 <project-title>: persist the title fields. Each
+            # is independently optional in the payload; only the keys
+            # the client sent get written.
+            if has_title_text:
+                cur.execute(
+                    "update project set title_text = %s where id = %s",
+                    (str(payload.get("title_text") or ""), project_id),
+                )
+            if has_title_size:
+                raw = payload.get("title_size")
+                size_val: Optional[int]
+                if raw in (None, ""):
+                    size_val = None
+                else:
+                    try:
+                        size_val = int(raw)
+                        if size_val <= 0:
+                            raise ValueError("title_size must be positive")
+                    except (TypeError, ValueError):
+                        raise HTTPException(
+                            status_code=400, detail="title_size must be a positive integer",
+                        )
+                cur.execute(
+                    "update project set title_size = %s where id = %s",
+                    (size_val, project_id),
+                )
+            if has_title_colour:
+                raw = payload.get("title_colour")
+                colour = (raw or "").strip() or None
+                # Accept #rgb / #rrggbb only; spec says 'Colour picker'
+                # which typically yields hex.
+                if colour is not None and not re.fullmatch(r"#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?", colour):
+                    raise HTTPException(
+                        status_code=400, detail="title_colour must be a hex colour like #rrggbb",
+                    )
+                cur.execute(
+                    "update project set title_colour = %s where id = %s",
+                    (colour, project_id),
+                )
+            if has_title_is_bold:
+                cur.execute(
+                    "update project set title_is_bold = %s where id = %s",
+                    (bool(payload.get("title_is_bold")), project_id),
                 )
             # FIX352.2.10 / FIX352.3.{2,3,4}: replace the slug list.
             # Validates non-empty labels and exactly one official entry.
@@ -2154,7 +2214,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 # keep working as long as their slug stays active.
                 cur.execute(
                     "select p.id, p.name, p.view_setup, "
-                    "       p.front_introduction, p.introduction "
+                    "       p.front_introduction, p.introduction, "
+                    "       p.title_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
                     "join project_slug s on s.project_id = p.id "
                     "where s.label = %s and s.is_active "
@@ -2170,7 +2231,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     # run on every environment.
                     cur.execute(
                         "select id, name, view_setup, "
-                        "       front_introduction, introduction "
+                        "       front_introduction, introduction, "
+                        "       title_text, title_size, title_colour, title_is_bold "
                         "from project order by sort_order, id"
                     )
                     rows = cur.fetchall()
@@ -2183,7 +2245,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             else:
                 cur.execute(
                     "select id, name, view_setup, "
-                    "       front_introduction, introduction "
+                    "       front_introduction, introduction, "
+                    "       title_text, title_size, title_colour, title_is_bold "
                     "from project "
                     "order by sort_order, id limit 1"
                 )
@@ -2274,6 +2337,12 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # is intentionally NOT included here — it's a HomeView
             # concern (FIX352.2.5).
             "introduction": project.get("introduction") or "",
+            # FIX352.2.7 + FIX503.2.13 + FIX503.2.20.1 <project-title>:
+            # decorative label rendered in the project page header.
+            "title_text": project.get("title_text") or "",
+            "title_size": project.get("title_size"),
+            "title_colour": project.get("title_colour"),
+            "title_is_bold": bool(project.get("title_is_bold")),
         },
         "properties": properties,
         "view_setup": project["view_setup"] or {},
