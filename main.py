@@ -1063,7 +1063,7 @@ def list_contact_messages(
                 if not allowed_ids:
                     return []
             sql = (
-                "select m.id, m.ts, m.project_id, p.name as project_name, "
+                "select m.id, m.ts, m.ip, m.project_id, p.name as project_name, "
                 "       m.sender_email, m.subject, m.body, m.email_invalid "
                 "from contact_message m "
                 "left join project p on p.id = m.project_id "
@@ -1088,6 +1088,10 @@ def list_contact_messages(
         {
             "id": r["id"],
             "ts": r["ts"].isoformat(),
+            # FIX421.2.1.8 + FIX421.4.1: surface the visitor's IP so the
+            # admin panel can render either the IP or its friendly
+            # name (when defined in <panel-ip-address-and-stats>).
+            "ip": r["ip"],
             "project_id": r["project_id"],
             "project_name": r["project_name"],
             "sender_email": r["sender_email"],
