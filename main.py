@@ -675,6 +675,40 @@ def _ip_short(ip: Optional[str]) -> str:
     return ip
 
 
+# FIX509 / FIX422: server-side mirror of the frontend t() helper.
+# Resolves a section-scoped i18n key against a language's labels
+# JSONB, with placeholder substitution for any {placeholder} tokens
+# the resolved text contains. Falls back to the key literal so the
+# default English text is always returned even with no language data.
+def _t(labels: Optional[dict], section: str, key: str,
+       vars: Optional[dict] = None) -> str:
+    text = key
+    if isinstance(labels, dict):
+        section_labels = labels.get(section)
+        if isinstance(section_labels, dict):
+            v = section_labels.get(key)
+            if isinstance(v, str) and v:
+                text = v
+    if vars:
+        for name, value in vars.items():
+            text = text.replace("{" + name + "}", "" if value is None else str(value))
+    return text
+
+
+def _fetch_lang_labels(cur, lang_code: Optional[str]) -> Optional[dict]:
+    """FIX509: pull the labels JSONB for a language code so the
+    auto-reply (FIX422) can render in the visitor's chosen
+    language. None when the code is missing / unknown — _t() then
+    falls back to the key literals (English by convention)."""
+    if not lang_code:
+        return None
+    cur.execute("select labels from language where code = %s", (lang_code,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row["labels"] or {}
+
+
 def _items_block(items: list[str], header: str) -> str:
     """Render a 'Selected items:' / 'Items you selected:' section
     used in both the admin forward and the sender echo. Empty
@@ -693,6 +727,7 @@ def _send_contact_email(
     sender_login: Optional[str] = None,
     items: Optional[list[str]] = None,
     project_name: Optional[str] = None,
+    lang_labels: Optional[dict] = None,
 ) -> Optional[str]:
     """Best-effort Resend send. Failures are swallowed so a Resend
     outage doesn't drop the user's message — the row is already in
@@ -755,18 +790,35 @@ def _send_contact_email(
     if RESEND_NOREPLY_FROM:
         when = datetime.now().strftime("%a %d %b %Y / %H:%M")
         proj_label = project_name or "the project"
-        echo_subject = f"We received your message about {proj_label}"
-        # FIX420.4.2.2 body shape: thank + project + date/time, then
-        # 'we'll reply soon', then the original subject + content.
-        # FIX420.4.2.2.1: include the items the sender kept ticked.
-        echo_body = (
-            f"Thank you for your message about \"{proj_label}\" on "
-            f"{when}.\n"
-            "\n"
-            "We will reply soon.\n"
-            "\n"
+        # FIX422 i18n: resolve every translatable string in the
+        # section '422. Automatic message reply' for the visitor's
+        # chosen language. Falls back to the English key literal.
+        SEC = "422. Automatic message reply"
+        thanks = _t(lang_labels, SEC, "Thank you for your message")
+        body_thanks = _t(
+            lang_labels, SEC,
+            'Thank you for your message about "{project-name}" on '
+            '{date-time-ddd-dd-hh-mm}.',
+            {"project-name": proj_label, "date-time-ddd-dd-hh-mm": when},
+        )
+        body_reply = _t(lang_labels, SEC, "We will reply soon.")
+        body_disclaimer = _t(
+            lang_labels, SEC,
             "(This is an automated acknowledgement; please do not "
-            "reply to this address.)\n"
+            "reply to this address.)",
+        )
+        # FIX422.2.1 subject:
+        #   'Showcase: {project-name} -- {Thank you for your message}'
+        echo_subject = f"Showcase: {proj_label} -- {thanks}"
+        # FIX422.2.2 body — three translated lines, then the
+        # selected-items + original-message echo (kept from the
+        # earlier FIX420.4.2.2.1 behaviour, English headers; if you
+        # want those translated too just add the keys).
+        echo_body = (
+            f"{body_thanks}\n"
+            "\n"
+            f"{body_reply}\n"
+            f"{body_disclaimer}\n"
             "\n"
             "----- Your message -----\n"
             f"{_items_block(items, 'Items you selected:')}"
@@ -951,6 +1003,11 @@ async def contact_admin(
     if items:
         items_block = "Selected items:\n" + "\n".join(f"  - {x}" for x in items)
         stored_body = f"{items_block}\n\n{message}"
+    # FIX422: visitor's chosen UI language code (e.g., 'fr'). The
+    # auto-reply email is rendered in that language when one is
+    # provided. None / unknown / 'en' all fall back to the key
+    # literals (English by convention).
+    lang_code = (payload.get("lang") or "").strip() or None
     # FIX421.2.1.2: tag the message with the project context it was
     # submitted from so <panel-message-list> can filter per project.
     project_id_raw = payload.get("project_id")
@@ -1017,6 +1074,9 @@ async def contact_admin(
                 row = cur.fetchone()
                 if row:
                     sender_login = row["login_name"]
+            # FIX422: pull the visitor language's labels JSONB so
+            # the auto-reply renders in their language.
+            lang_labels = _fetch_lang_labels(cur, lang_code)
         conn.commit()
     # FIX420.3.1.3 + FIX420.4.2.2.1: pass the original (unprepended)
     # message + the items list separately so the email builders can
@@ -1030,6 +1090,7 @@ async def contact_admin(
         sender_login=sender_login,
         items=items,
         project_name=project_name,
+        lang_labels=lang_labels,
     )
     if echo_message_id:
         # Best-effort: link the echo's Resend id to the row so the
