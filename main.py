@@ -621,6 +621,46 @@ def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     return None
 
 
+def _ip_geolocation(ip: Optional[str]) -> Optional[str]:
+    """FIX420.3.1.3.6: query ipapi.co for the sender's IP and return
+    a concise human-readable string for the admin forward email
+    (e.g. 'Paris, Île-de-France, France — Free SAS').
+    Returns None on any error, on a private/loopback IP, or when no
+    IP is available. The caller silently omits the section in that
+    case so a slow / failing geo-lookup never blocks the email send."""
+    if not ip:
+        return None
+    # Skip RFC1918 + loopback + link-local + IPv6 loopback. Public
+    # ipapi.co would return 'Reserved Range' for these anyway.
+    if (
+        ip.startswith(("10.", "127.", "169.254.", "192.168."))
+        or ip.startswith(tuple(f"172.{i}." for i in range(16, 32)))
+        or ip == "::1"
+    ):
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://ipapi.co/{ip}/json/",
+            headers={"User-Agent": "showcase-api/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("error"):
+        return None
+    parts = []
+    for key in ("city", "region", "country_name"):
+        v = data.get(key)
+        if v:
+            parts.append(str(v))
+    location = ", ".join(parts) if parts else None
+    isp = data.get("org") or None
+    if location and isp:
+        return f"{location} — {isp}"
+    return location or isp
+
+
 def _ip_short(ip: Optional[str]) -> str:
     """FIX420.3.1.3.10.1: when no logged-in user is available, the
     admin-email subject identifies the sender by the last two
@@ -677,10 +717,16 @@ def _send_contact_email(
     user_id_str = sender_login or _ip_short(sender_ip)
     proj_label = project_name or "unknown"
     admin_subject = f"[{proj_label}] {user_id_str} -- {subject}"
+    # FIX420.3.1.3.6 sender geolocation, best-effort.
+    location = _ip_geolocation(sender_ip)
+    location_line = f"Sender location: {location}\n" if location else ""
     # 1) FIX420.3.1.3 admin forward.
     admin_body = (
         # FIX420.3.1.3.1 sender IP.
         f"Sender IP: {sender_ip or '(unknown)'}\n"
+        # FIX420.3.1.3.6 sender location (one line, omitted when the
+        # geo-lookup failed or the IP is private).
+        f"{location_line}"
         # FIX420.3.1.3.2 sender reply addr.
         f"Reply to: {sender_email}\n"
         "\n"
