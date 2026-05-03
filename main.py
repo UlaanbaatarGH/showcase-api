@@ -1924,6 +1924,27 @@ def list_versions(_admin=Depends(current_admin_required)):
 # languages + their per-key label maps. Public GET /api/languages
 # (anyone can resolve labels), admin-only writes.
 # ============================================================
+def _clean_labels_payload(obj, depth: int = 0):
+    """Recursively coerce a labels payload into a clean JSON-friendly
+    shape. Top level: { 'NNN. section': { 'key': 'value' } }.
+    Strings stay strings, dicts recurse one level, anything else is
+    dropped. Cap depth at 2 so a malformed deep payload can't blow
+    up the JSONB column."""
+    if depth > 2 or not isinstance(obj, dict):
+        return {} if isinstance(obj, dict) else None
+    out: dict = {}
+    for k, v in obj.items():
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            sub = _clean_labels_payload(v, depth + 1)
+            if sub:
+                out[str(k)] = sub
+        elif isinstance(v, (str, int, float, bool)):
+            out[str(k)] = str(v)
+    return out
+
+
 def _row_to_language(r: dict) -> dict:
     return {
         "code": r["code"],
@@ -2031,9 +2052,13 @@ async def update_language(
                 labels = payload.get("labels")
                 if not isinstance(labels, dict):
                     raise HTTPException(status_code=400, detail="labels must be an object")
-                # Stringify all values defensively — numbers / booleans are
-                # not valid label content.
-                cleaned = {str(k): str(v) for k, v in labels.items() if v is not None}
+                # FIX509 v2: labels are nested by section, e.g.
+                #   { '420. Contact panel': { 'Cancel': 'Annuler' } }
+                # Recursively keep the dict shape intact — the previous
+                # implementation stringified top-level values, which
+                # destroyed the nested sections (str({'Cancel':'X'})
+                # produces a Python repr, not JSON).
+                cleaned = _clean_labels_payload(labels)
                 cur.execute(
                     "update language set labels = %s::jsonb where code = %s",
                     (json.dumps(cleaned), code),
