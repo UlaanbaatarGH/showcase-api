@@ -621,6 +621,20 @@ def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     return None
 
 
+def _ip_short(ip: Optional[str]) -> str:
+    """FIX420.3.1.3.10.1: when no logged-in user is available, the
+    admin-email subject identifies the sender by the last two
+    octets of their IPv4 address ('86.247.88.129' -> '88.129').
+    Falls back to the full IP for IPv6 / unparseable inputs, or
+    '(unknown)' when no IP at all."""
+    if not ip:
+        return "(unknown)"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return f"{parts[2]}.{parts[3]}"
+    return ip
+
+
 def _items_block(items: list[str], header: str) -> str:
     """Render a 'Selected items:' / 'Items you selected:' section
     used in both the admin forward and the sender echo. Empty
@@ -636,6 +650,7 @@ def _send_contact_email(
     message: str,
     sender_email: str,
     sender_ip: Optional[str] = None,
+    sender_login: Optional[str] = None,
     items: Optional[list[str]] = None,
     project_name: Optional[str] = None,
 ) -> Optional[str]:
@@ -656,7 +671,12 @@ def _send_contact_email(
     if not RESEND_API_KEY or not contact_to:
         print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
         return None
-    project_tag = f" [{project_name}]" if project_name else ""
+    # FIX420.3.1.3.10 admin-email subject: '[<project>] <user-id> -- <msg-subject>'.
+    # FIX420.3.1.3.10.1: <user-id> = login name when signed in, else
+    # the last two octets of the IPv4 (88.129 for 86.247.88.129).
+    user_id_str = sender_login or _ip_short(sender_ip)
+    proj_label = project_name or "unknown"
+    admin_subject = f"[{proj_label}] {user_id_str} -- {subject}"
     # 1) FIX420.3.1.3 admin forward.
     admin_body = (
         # FIX420.3.1.3.1 sender IP.
@@ -676,7 +696,7 @@ def _send_contact_email(
             "from": RESEND_FROM,
             "to": [contact_to],
             "reply_to": sender_email,
-            "subject": f"{subject}{project_tag}",
+            "subject": admin_subject,
             "text": admin_body,
         },
         label="admin forward",
@@ -862,7 +882,10 @@ async def signup_visitor(request: Request):
 # per IP (FIX420.4.1).
 # ============================================================
 @app.post("/api/contact")
-async def contact_admin(request: Request):
+async def contact_admin(
+    request: Request,
+    user=Depends(current_user_optional),
+):
     payload = await request.json() if await request.body() else {}
     subject = (payload.get("subject") or "").strip()
     message = (payload.get("message") or "").strip()
@@ -936,6 +959,18 @@ async def contact_admin(request: Request):
                 pr = cur.fetchone()
                 if pr:
                     project_name = pr["name"]
+            # FIX420.3.1.3.10.1: when the sender is signed in, use
+            # their login_name in the admin-email subject. Falls back
+            # to the IP-octet form when anonymous.
+            sender_login: Optional[str] = None
+            if user is not None:
+                cur.execute(
+                    "select login_name from app_user where id = %s",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+                if row:
+                    sender_login = row["login_name"]
         conn.commit()
     # FIX420.3.1.3 + FIX420.4.2.2.1: pass the original (unprepended)
     # message + the items list separately so the email builders can
@@ -946,6 +981,7 @@ async def contact_admin(request: Request):
         message=message,
         sender_email=email,
         sender_ip=ip,
+        sender_login=sender_login,
         items=items,
         project_name=project_name,
     )
