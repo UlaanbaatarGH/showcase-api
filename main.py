@@ -1164,14 +1164,14 @@ def list_admin_projects(user=Depends(current_user_required)):
                 cur.execute(
                     "select id, name, is_public, sort_order, "
                     "       front_introduction, introduction, "
-                    "       title_text, title_size, title_colour, title_is_bold "
+                    "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project order by sort_order, id"
                 )
             else:
                 cur.execute(
                     "select p.id, p.name, p.is_public, p.sort_order, "
                     "       p.front_introduction, p.introduction, "
-                    "       p.title_text, p.title_size, p.title_colour, p.title_is_bold "
+                    "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
                     "join project_access pa on pa.project_id = p.id "
                     "where pa.user_id = %s "
@@ -1252,7 +1252,8 @@ def list_admin_projects(user=Depends(current_user_required)):
             "slugs": slugs_by_proj.get(p["id"], []),
             # FIX352.2.7 <project-title>: optional decorative label
             # rendered in the project page header.
-            "title_text": p.get("title_text") or "",
+            "title_long_text": p.get("title_long_text") or "",
+            "title_short_text": p.get("title_short_text") or "",
             "title_size": p.get("title_size"),
             "title_colour": p.get("title_colour"),
             "title_is_bold": bool(p.get("title_is_bold")),
@@ -1360,9 +1361,10 @@ async def update_admin_project(
     slugs = payload.get("slugs")  # list of {label, is_official, is_active} or None
     # FIX352.2.7 <project-title>: optional decorative label + style.
     # `null` clears the optional ones (size, colour); use empty
-    # string to clear title_text. Each is independently skip-able by
-    # omitting the key.
-    has_title_text = "title_text" in payload
+    # string to clear title_long_text / title_short_text. Each is
+    # independently skip-able by omitting the key.
+    has_title_long_text = "title_long_text" in payload
+    has_title_short_text = "title_short_text" in payload
     has_title_size = "title_size" in payload
     has_title_colour = "title_colour" in payload
     has_title_is_bold = "title_is_bold" in payload
@@ -1465,10 +1467,15 @@ async def update_admin_project(
             # FIX352.2.7 <project-title>: persist the title fields. Each
             # is independently optional in the payload; only the keys
             # the client sent get written.
-            if has_title_text:
+            if has_title_long_text:
                 cur.execute(
-                    "update project set title_text = %s where id = %s",
-                    (str(payload.get("title_text") or ""), project_id),
+                    "update project set title_long_text = %s where id = %s",
+                    (str(payload.get("title_long_text") or ""), project_id),
+                )
+            if has_title_short_text:
+                cur.execute(
+                    "update project set title_short_text = %s where id = %s",
+                    (str(payload.get("title_short_text") or ""), project_id),
                 )
             if has_title_size:
                 raw = payload.get("title_size")
@@ -2215,7 +2222,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 cur.execute(
                     "select p.id, p.name, p.view_setup, "
                     "       p.front_introduction, p.introduction, "
-                    "       p.title_text, p.title_size, p.title_colour, p.title_is_bold "
+                    "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
                     "join project_slug s on s.project_id = p.id "
                     "where s.label = %s and s.is_active "
@@ -2232,7 +2239,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     cur.execute(
                         "select id, name, view_setup, "
                         "       front_introduction, introduction, "
-                        "       title_text, title_size, title_colour, title_is_bold "
+                        "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                         "from project order by sort_order, id"
                     )
                     rows = cur.fetchall()
@@ -2246,7 +2253,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 cur.execute(
                     "select id, name, view_setup, "
                     "       front_introduction, introduction, "
-                    "       title_text, title_size, title_colour, title_is_bold "
+                    "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project "
                     "order by sort_order, id limit 1"
                 )
@@ -2339,7 +2346,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "introduction": project.get("introduction") or "",
             # FIX352.2.7 + FIX503.2.13 + FIX503.2.20.1 <project-title>:
             # decorative label rendered in the project page header.
-            "title_text": project.get("title_text") or "",
+            "title_long_text": project.get("title_long_text") or "",
+            "title_short_text": project.get("title_short_text") or "",
             "title_size": project.get("title_size"),
             "title_colour": project.get("title_colour"),
             "title_is_bold": bool(project.get("title_is_bold")),
