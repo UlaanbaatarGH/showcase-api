@@ -1730,6 +1730,153 @@ def list_versions(_admin=Depends(current_admin_required)):
     }
 
 
+# ============================================================
+# FIX509 <panel-language-setup>: i18n storage. The full list of
+# languages + their per-key label maps. Public GET /api/languages
+# (anyone can resolve labels), admin-only writes.
+# ============================================================
+def _row_to_language(r: dict) -> dict:
+    return {
+        "code": r["code"],
+        "name": r["name"],
+        "is_default": bool(r["is_default"]),
+        "labels": r["labels"] or {},
+        "sort_order": r["sort_order"],
+    }
+
+
+@app.get("/api/languages")
+def list_languages():
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select code, name, is_default, labels, sort_order "
+                "from language order by sort_order, code"
+            )
+            rows = cur.fetchall()
+    return [_row_to_language(r) for r in rows]
+
+
+_LANG_CODE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,15}$")
+
+
+def _validate_language_code(code: str) -> str:
+    code = (code or "").strip()
+    if not _LANG_CODE_RE.match(code):
+        raise HTTPException(
+            status_code=400,
+            detail="code must be 1–16 chars, [A-Za-z0-9_-], starting with a letter",
+        )
+    return code
+
+
+@app.post("/api/admin/languages")
+async def create_language(request: Request, _admin=Depends(current_admin_required)):
+    payload = await request.json() if await request.body() else {}
+    code = _validate_language_code(payload.get("code") or "")
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    is_default = bool(payload.get("is_default"))
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from language where code = %s", (code,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="language already exists")
+            # Append to the end of the order list.
+            cur.execute(
+                "select coalesce(max(sort_order), -1) + 1 as next from language"
+            )
+            next_order = cur.fetchone()["next"]
+            if is_default:
+                # Only one default at a time — clear the existing one first.
+                cur.execute("update language set is_default = false where is_default")
+            cur.execute(
+                "insert into language (code, name, is_default, sort_order) "
+                "values (%s, %s, %s, %s) "
+                "returning code, name, is_default, labels, sort_order",
+                (code, name, is_default, next_order),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_language(row)
+
+
+@app.patch("/api/admin/languages/{code}")
+async def update_language(
+    code: str,
+    request: Request,
+    _admin=Depends(current_admin_required),
+):
+    payload = await request.json() if await request.body() else {}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from language where code = %s", (code,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="language not found")
+            if "name" in payload:
+                name = (payload.get("name") or "").strip()
+                if not name:
+                    raise HTTPException(status_code=400, detail="name cannot be empty")
+                cur.execute(
+                    "update language set name = %s where code = %s",
+                    (name, code),
+                )
+            if "is_default" in payload:
+                if payload.get("is_default"):
+                    cur.execute(
+                        "update language set is_default = false "
+                        "where is_default and code != %s",
+                        (code,),
+                    )
+                    cur.execute(
+                        "update language set is_default = true where code = %s",
+                        (code,),
+                    )
+                else:
+                    cur.execute(
+                        "update language set is_default = false where code = %s",
+                        (code,),
+                    )
+            if "labels" in payload:
+                labels = payload.get("labels")
+                if not isinstance(labels, dict):
+                    raise HTTPException(status_code=400, detail="labels must be an object")
+                # Stringify all values defensively — numbers / booleans are
+                # not valid label content.
+                cleaned = {str(k): str(v) for k, v in labels.items() if v is not None}
+                cur.execute(
+                    "update language set labels = %s::jsonb where code = %s",
+                    (json.dumps(cleaned), code),
+                )
+            cur.execute(
+                "select code, name, is_default, labels, sort_order "
+                "from language where code = %s",
+                (code,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_language(row)
+
+
+@app.delete("/api/admin/languages/{code}")
+def delete_language(code: str, _admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select is_default from language where code = %s", (code,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="language not found")
+            if row["is_default"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cannot delete the default language",
+                )
+            cur.execute("delete from language where code = %s", (code,))
+        conn.commit()
+    return {"ok": True}
+
+
 @app.post("/api/admin/projects/{project_id}/move")
 async def move_admin_project(
     project_id: int,
