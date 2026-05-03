@@ -1518,19 +1518,27 @@ def _short_sha(sha: Optional[str]) -> Optional[str]:
 
 def _normalize_render_status(s: str) -> str:
     s = (s or "").lower()
-    if s in ("live",):
+    if s == "live":
         return "live"
-    if "in_progress" in s or s in ("created", "queued", "build_in_progress", "update_in_progress", "pre_deploy_in_progress"):
+    # 'deactivated' = was live, then superseded by a newer deploy.
+    # Treat as a successful past deploy, NOT a failure.
+    if s in ("deactivated", "succeeded"):
+        return "succeeded"
+    if "in_progress" in s or s in ("created", "queued"):
         return "building"
-    if "failed" in s or s in ("canceled", "deactivated"):
+    if "failed" in s or s == "canceled":
         return "failed"
     return s or "unknown"
 
 
 def _normalize_vercel_status(s: str) -> str:
+    # Vercel's `state` doesn't say "this one is currently serving" — every
+    # historical successful prod deploy stays READY forever. The caller
+    # marks only the most recent READY as 'live' and downgrades the rest
+    # to 'succeeded'; this function only resolves the raw state string.
     s = (s or "").upper()
     if s == "READY":
-        return "live"
+        return "succeeded"
     if s in ("BUILDING", "QUEUED", "INITIALIZING"):
         return "building"
     if s in ("ERROR", "CANCELED"):
@@ -1587,8 +1595,11 @@ def _fetch_vercel_deploys() -> dict:
     if not token or not project_id:
         return {"deploys": [], "note": "VERCEL_TOKEN / VERCEL_PROJECT_ID not set"}
     try:
+        # target=production filters out preview branch deploys so the
+        # panel only shows what was meant for the live site.
         data = _http_get_json(
-            f"https://api.vercel.com/v6/deployments?projectId={project_id}&limit=20",
+            f"https://api.vercel.com/v6/deployments"
+            f"?projectId={project_id}&target=production&limit=20",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -1597,6 +1608,7 @@ def _fetch_vercel_deploys() -> dict:
     except Exception as e:
         return {"deploys": [], "note": f"Vercel API error: {e}"}
     out = []
+    promoted_live = False  # only the first READY deploy becomes 'live'.
     for d in (data or {}).get("deployments", []) or []:
         meta = d.get("meta") or {}
         sha_full = (
@@ -1605,11 +1617,15 @@ def _fetch_vercel_deploys() -> dict:
             or meta.get("bitbucketCommitSha")
         )
         message = meta.get("githubCommitMessage") or meta.get("gitlabCommitMessage")
+        status = _normalize_vercel_status(d.get("state") or d.get("readyState"))
+        if status == "succeeded" and not promoted_live:
+            status = "live"
+            promoted_live = True
         out.append({
             "sha": _short_sha(sha_full),
             "sha_full": sha_full,
             "message": (message or "").splitlines()[0] if message else None,
-            "status": _normalize_vercel_status(d.get("state") or d.get("readyState")),
+            "status": status,
             "raw_status": d.get("state") or d.get("readyState"),
             "created_at": _ms_to_iso(d.get("created")),
             "effective_at": _ms_to_iso(d.get("ready") or d.get("created")),
