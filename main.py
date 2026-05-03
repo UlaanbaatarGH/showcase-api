@@ -1144,12 +1144,14 @@ def list_admin_projects(user=Depends(current_user_required)):
             caller_is_admin = bool(pr and pr["profile"] == "admin")
             if caller_is_admin:
                 cur.execute(
-                    "select id, name, is_public, sort_order "
+                    "select id, name, is_public, sort_order, "
+                    "       front_introduction, introduction "
                     "from project order by sort_order, id"
                 )
             else:
                 cur.execute(
-                    "select p.id, p.name, p.is_public, p.sort_order "
+                    "select p.id, p.name, p.is_public, p.sort_order, "
+                    "       p.front_introduction, p.introduction "
                     "from project p "
                     "join project_access pa on pa.project_id = p.id "
                     "where pa.user_id = %s "
@@ -1159,6 +1161,19 @@ def list_admin_projects(user=Depends(current_user_required)):
                     (user["id"],),
                 )
             projects = cur.fetchall()
+            # FIX352.2.10 <project-slugs>: per-project slug list.
+            cur.execute(
+                "select project_id, label, is_official, is_active, sort_order "
+                "from project_slug order by project_id, sort_order, id"
+            )
+            slug_rows = cur.fetchall()
+            slugs_by_proj: dict[int, list] = {}
+            for s in slug_rows:
+                slugs_by_proj.setdefault(s["project_id"], []).append({
+                    "label": s["label"],
+                    "is_official": bool(s["is_official"]),
+                    "is_active": bool(s["is_active"]),
+                })
             cur.execute(
                 "select pa.project_id, pa.user_id, u.login_name, "
                 "       pa.is_data_manager, pa.is_user_manager "
@@ -1211,6 +1226,10 @@ def list_admin_projects(user=Depends(current_user_required)):
             "data_managers": data_by_proj.get(p["id"], []),
             "user_managers": user_by_proj.get(p["id"], []),
             "image_bytes": bytes_by_proj.get(p["id"], 0),
+            # FIX352.2.5 / .2.6 / .2.10
+            "front_introduction": p.get("front_introduction") or "",
+            "introduction": p.get("introduction") or "",
+            "slugs": slugs_by_proj.get(p["id"], []),
         }
         for p in projects
     ]
@@ -1308,6 +1327,11 @@ async def update_admin_project(
     is_public = payload.get("is_public")  # bool or None to skip
     data_managers = payload.get("data_managers")
     user_managers = payload.get("user_managers")
+    # FIX352.2.5 / .2.6: free-form intros (None = skip; '' = clear).
+    front_introduction = payload.get("front_introduction")
+    introduction = payload.get("introduction")
+    # FIX352.2.10 / FIX352.3.{2,3,4}: editable slug list.
+    slugs = payload.get("slugs")  # list of {label, is_official, is_active} or None
     # Backward compat: legacy clients send 'managers' meaning both
     # roles at once — treat the list as both data + user managers so
     # the row state matches the pre-split semantics.
@@ -1392,6 +1416,79 @@ async def update_admin_project(
                         " group2_rights, group3_rights) "
                         "values (%s, %s, %s, %s, 'CRUD', 'CRUD')",
                         (uid, project_id, uid in data_set, uid in user_set),
+                    )
+            # FIX352.2.5 / .2.6: persist the introductions.
+            if front_introduction is not None:
+                cur.execute(
+                    "update project set front_introduction = %s where id = %s",
+                    (str(front_introduction), project_id),
+                )
+            if introduction is not None:
+                cur.execute(
+                    "update project set introduction = %s where id = %s",
+                    (str(introduction), project_id),
+                )
+            # FIX352.2.10 / FIX352.3.{2,3,4}: replace the slug list.
+            # Validates non-empty labels and exactly one official entry.
+            if slugs is not None:
+                if not isinstance(slugs, list) or len(slugs) == 0:
+                    raise HTTPException(
+                        status_code=400, detail="slugs must be a non-empty list"
+                    )
+                cleaned = []
+                official_count = 0
+                seen_labels: set[str] = set()
+                for s in slugs:
+                    if not isinstance(s, dict):
+                        raise HTTPException(status_code=400, detail="slug entry must be object")
+                    label = (s.get("label") or "").strip()
+                    if not label or not re.fullmatch(r"[a-z0-9]+", label):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"invalid slug label: {label!r}",
+                        )
+                    if label in seen_labels:
+                        raise HTTPException(
+                            status_code=400, detail=f"duplicate slug label: {label}",
+                        )
+                    seen_labels.add(label)
+                    is_official = bool(s.get("is_official"))
+                    is_active = bool(s.get("is_active"))
+                    if is_official:
+                        official_count += 1
+                        # FIX352.3.4.2: official is always active.
+                        is_active = True
+                    cleaned.append((label, is_official, is_active))
+                if official_count != 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="exactly one slug must be official",
+                    )
+                # FIX352.3.4.2 cross-project rule: an active label must
+                # be globally unique. Reject up-front rather than rely
+                # on the DB constraint so the error stays user-readable.
+                cur.execute(
+                    "select label from project_slug "
+                    "where project_id != %s and is_active "
+                    "  and label = any(%s)",
+                    (project_id, [c[0] for c in cleaned if c[2]]),
+                )
+                clash = cur.fetchone()
+                if clash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"slug already used by another project: {clash['label']}",
+                    )
+                cur.execute(
+                    "delete from project_slug where project_id = %s",
+                    (project_id,),
+                )
+                for i, (label, is_official, is_active) in enumerate(cleaned):
+                    cur.execute(
+                        "insert into project_slug "
+                        "(project_id, label, is_official, is_active, sort_order) "
+                        "values (%s, %s, %s, %s, %s)",
+                        (project_id, label, is_official, is_active, i),
                     )
         conn.commit()
     return {"ok": True}
@@ -1658,6 +1755,7 @@ def list_projects(user=Depends(current_user_optional)):
             if user is None:
                 cur.execute(
                     "select id, name, cover_image_key, is_public, "
+                    "       front_introduction, "
                     "       false as can_edit "
                     "from project where is_public "
                     "order by sort_order, id"
@@ -1673,6 +1771,7 @@ def list_projects(user=Depends(current_user_optional)):
                 if is_caller_admin:
                     cur.execute(
                         "select p.id, p.name, p.cover_image_key, p.is_public, "
+                        "       p.front_introduction, "
                         "       true as can_edit "
                         "from project p "
                         "order by p.sort_order, p.id"
@@ -1684,6 +1783,7 @@ def list_projects(user=Depends(current_user_optional)):
                     # a column that isn't in a SELECT DISTINCT list.
                     cur.execute(
                         "select p.id, p.name, p.cover_image_key, p.is_public, "
+                        "       p.front_introduction, "
                         "       (p.owner_id = %s or p.owner_id is null) as can_edit "
                         "from project p "
                         "where p.is_public "
@@ -1696,6 +1796,15 @@ def list_projects(user=Depends(current_user_optional)):
                         (user["id"], user["id"], user["id"]),
                     )
             rows = cur.fetchall()
+            # Map each project id → its current official slug so the
+            # frontend can link to a stable URL even after a rename
+            # (FIX352.3.4.1). Missing (legacy) projects fall back to a
+            # JS-equivalent slugify of the name in the response.
+            cur.execute(
+                "select project_id, label "
+                "from project_slug where is_official"
+            )
+            official_by_proj = {r["project_id"]: r["label"] for r in cur.fetchall()}
     return [
         {
             "id": r["id"],
@@ -1704,6 +1813,10 @@ def list_projects(user=Depends(current_user_optional)):
             "can_edit": bool(r["can_edit"]),
             "cover_image_url": (
                 public_image_url(r["cover_image_key"]) if r["cover_image_key"] else None
+            ),
+            "front_introduction": r.get("front_introduction") or "",
+            "official_slug": (
+                official_by_proj.get(r["id"]) or _slugify_name(r["name"])
             ),
         }
         for r in rows
@@ -1866,19 +1979,43 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if slug:
+                # FIX352.2.10 + FIX352.3.4: resolve the URL slug against
+                # the project_slug table — any *active* slug for the
+                # project resolves it, so URLs from before a rename
+                # keep working as long as their slug stays active.
                 cur.execute(
-                    "select id, name, view_setup from project order by sort_order, id"
+                    "select p.id, p.name, p.view_setup, "
+                    "       p.front_introduction, p.introduction "
+                    "from project p "
+                    "join project_slug s on s.project_id = p.id "
+                    "where s.label = %s and s.is_active "
+                    "limit 1",
+                    (slug,),
                 )
-                rows = cur.fetchall()
-                project = next(
-                    (r for r in rows if _slugify_name(r["name"]) == slug),
-                    None,
-                )
+                project = cur.fetchone()
+                if not project:
+                    # Legacy fallback: pre-migration projects whose
+                    # slug rows haven't been backfilled yet still
+                    # resolve via the JS-equivalent slugify of the
+                    # project name. Drop this once the migration has
+                    # run on every environment.
+                    cur.execute(
+                        "select id, name, view_setup, "
+                        "       front_introduction, introduction "
+                        "from project order by sort_order, id"
+                    )
+                    rows = cur.fetchall()
+                    project = next(
+                        (r for r in rows if _slugify_name(r["name"]) == slug),
+                        None,
+                    )
                 if not project:
                     raise HTTPException(status_code=404, detail="project not found")
             else:
                 cur.execute(
-                    "select id, name, view_setup from project "
+                    "select id, name, view_setup, "
+                    "       front_introduction, introduction "
+                    "from project "
                     "order by sort_order, id limit 1"
                 )
                 project = cur.fetchone()
@@ -1963,6 +2100,11 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "id": project["id"],
             "name": project["name"],
             "is_admin_or_manager": is_admin_or_manager,
+            # FIX352.2.6 / FIX503.3.5: surface the introduction so the
+            # ShowcaseView About popup can render it. front_introduction
+            # is intentionally NOT included here — it's a HomeView
+            # concern (FIX352.2.5).
+            "introduction": project.get("introduction") or "",
         },
         "properties": properties,
         "view_setup": project["view_setup"] or {},
