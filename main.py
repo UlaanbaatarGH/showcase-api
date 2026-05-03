@@ -621,10 +621,22 @@ def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
     return None
 
 
+def _items_block(items: list[str], header: str) -> str:
+    """Render a 'Selected items:' / 'Items you selected:' section
+    used in both the admin forward and the sender echo. Empty
+    string when there's nothing to list."""
+    if not items:
+        return ""
+    bullets = "\n".join(f"  - {x}" for x in items)
+    return f"{header}\n{bullets}\n\n"
+
+
 def _send_contact_email(
     subject: str,
     message: str,
     sender_email: str,
+    sender_ip: Optional[str] = None,
+    items: Optional[list[str]] = None,
     project_name: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort Resend send. Failures are swallowed so a Resend
@@ -633,21 +645,39 @@ def _send_contact_email(
     the echo message id when one was sent (used by /api/contact to
     store it on the row so a later bounce webhook can find it).
 
-    FIX420.4.2.{1,2}: the auto-reply subject + body name the project
-    the message was about and the date/time it was received."""
+    FIX420.3.1.3 admin forward sections:
+      .3.1 sender IP, .3.2 sender reply addr, .3.3 list of items,
+      .3.4 subject + text.
+    FIX420.4.2.{1,2} auto-reply: subject + body name the project and
+    date/time. FIX420.4.2.2.1: also list the selected items the
+    sender kept ticked."""
+    items = items or []
     contact_to = _resolve_contact_to()
     if not RESEND_API_KEY or not contact_to:
         print(f"[contact] from={sender_email!r} subject={subject!r} body={message!r}")
         return None
-    # 1) Forward the message to the admin inbox.
     project_tag = f" [{project_name}]" if project_name else ""
+    # 1) FIX420.3.1.3 admin forward.
+    admin_body = (
+        # FIX420.3.1.3.1 sender IP.
+        f"Sender IP: {sender_ip or '(unknown)'}\n"
+        # FIX420.3.1.3.2 sender reply addr.
+        f"Reply to: {sender_email}\n"
+        "\n"
+        # FIX420.3.1.3.3 selected items.
+        f"{_items_block(items, 'Selected items:')}"
+        # FIX420.3.1.3.4 subject + message text.
+        f"Subject: {subject}\n"
+        "\n"
+        f"{message}\n"
+    )
     _resend_send(
         {
             "from": RESEND_FROM,
             "to": [contact_to],
             "reply_to": sender_email,
             "subject": f"{subject}{project_tag}",
-            "text": f"Sender: {sender_email}\n\n{message}",
+            "text": admin_body,
         },
         label="admin forward",
     )
@@ -657,11 +687,12 @@ def _send_contact_email(
     # reachable). Until then this stays dormant.
     echo_id: Optional[str] = None
     if RESEND_NOREPLY_FROM:
-        # FIX420.4.2.2 body shape: thank + project + date/time, then
-        # 'we'll reply soon', then the original subject + content.
         when = datetime.now().strftime("%a %d %b %Y / %H:%M")
         proj_label = project_name or "the project"
         echo_subject = f"We received your message about {proj_label}"
+        # FIX420.4.2.2 body shape: thank + project + date/time, then
+        # 'we'll reply soon', then the original subject + content.
+        # FIX420.4.2.2.1: include the items the sender kept ticked.
         echo_body = (
             f"Thank you for your message about \"{proj_label}\" on "
             f"{when}.\n"
@@ -672,6 +703,7 @@ def _send_contact_email(
             "reply to this address.)\n"
             "\n"
             "----- Your message -----\n"
+            f"{_items_block(items, 'Items you selected:')}"
             f"Subject: {subject}\n"
             "\n"
             f"{message}\n"
@@ -837,16 +869,19 @@ async def contact_admin(request: Request):
     email = (payload.get("email") or "").strip()
     # FIX420.4.2.4 <item-selection>: optional list of short labels for
     # the items the visitor had selected on the Showcase List and kept
-    # ticked. Stored at the head of the message body (so the admin's
-    # forwarded email and the auto-reply both see them) — no separate
-    # column for now.
+    # ticked. Used by:
+    # - FIX420.3.1.3.3 admin forward email (its own section).
+    # - FIX420.4.2.2.1 sender echo email (its own section).
+    # - <panel-message-list> body cell (prepended to the stored body
+    #   so the admin sees the items in-context, no separate column).
     raw_items = payload.get("items")
     items: list[str] = []
     if isinstance(raw_items, list):
         items = [str(x).strip() for x in raw_items if str(x).strip()]
+    stored_body = message
     if items:
         items_block = "Selected items:\n" + "\n".join(f"  - {x}" for x in items)
-        message = f"{items_block}\n\n{message}"
+        stored_body = f"{items_block}\n\n{message}"
     # FIX421.2.1.2: tag the message with the project context it was
     # submitted from so <panel-message-list> can filter per project.
     project_id_raw = payload.get("project_id")
@@ -887,7 +922,7 @@ async def contact_admin(request: Request):
                 "insert into contact_message "
                 "(ip, subject, body, sender_email, project_id) "
                 "values (%s, %s, %s, %s, %s) returning id",
-                (ip, subject, message, email, project_id),
+                (ip, subject, stored_body, email, project_id),
             )
             row_id = cur.fetchone()["id"]
             # FIX420.4.2.2: fetch the project name so the echo can
@@ -902,7 +937,18 @@ async def contact_admin(request: Request):
                 if pr:
                     project_name = pr["name"]
         conn.commit()
-    echo_message_id = _send_contact_email(subject, message, email, project_name)
+    # FIX420.3.1.3 + FIX420.4.2.2.1: pass the original (unprepended)
+    # message + the items list separately so the email builders can
+    # render the IP / reply-to / items / subject / body sections
+    # cleanly per spec.
+    echo_message_id = _send_contact_email(
+        subject=subject,
+        message=message,
+        sender_email=email,
+        sender_ip=ip,
+        items=items,
+        project_name=project_name,
+    )
     if echo_message_id:
         # Best-effort: link the echo's Resend id to the row so the
         # webhook can flip email_invalid later. Failure here is
