@@ -1494,6 +1494,141 @@ async def update_admin_project(
     return {"ok": True}
 
 
+# FIX414 <panel-app-versions>: combined deploy history for the
+# Render backend and the Vercel frontend. Admin-only. Each platform
+# response is normalized to a common shape so the UI can render the
+# two lists side-by-side without dealing with provider quirks.
+#
+# Required env vars (set on Render):
+#   RENDER_API_KEY     — generate at https://dashboard.render.com/u/settings/api-keys
+#   RENDER_SERVICE_ID  — e.g. srv-XXXX, from the service URL
+#   VERCEL_TOKEN       — generate at https://vercel.com/account/tokens
+#   VERCEL_PROJECT_ID  — prj_XXXX, from the project's settings page
+# When a token is missing, that platform's section returns an empty
+# list with a `note` field — the panel still renders the other side.
+def _http_get_json(url: str, headers: dict, timeout: int = 10):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _short_sha(sha: Optional[str]) -> Optional[str]:
+    return sha[:7] if isinstance(sha, str) and sha else None
+
+
+def _normalize_render_status(s: str) -> str:
+    s = (s or "").lower()
+    if s in ("live",):
+        return "live"
+    if "in_progress" in s or s in ("created", "queued", "build_in_progress", "update_in_progress", "pre_deploy_in_progress"):
+        return "building"
+    if "failed" in s or s in ("canceled", "deactivated"):
+        return "failed"
+    return s or "unknown"
+
+
+def _normalize_vercel_status(s: str) -> str:
+    s = (s or "").upper()
+    if s == "READY":
+        return "live"
+    if s in ("BUILDING", "QUEUED", "INITIALIZING"):
+        return "building"
+    if s in ("ERROR", "CANCELED"):
+        return "failed"
+    return s.lower() or "unknown"
+
+
+def _ms_to_iso(ms: Optional[int]) -> Optional[str]:
+    if not ms:
+        return None
+    try:
+        return datetime.utcfromtimestamp(int(ms) / 1000).isoformat() + "Z"
+    except Exception:
+        return None
+
+
+def _fetch_render_deploys() -> dict:
+    api_key = os.getenv("RENDER_API_KEY")
+    service_id = os.getenv("RENDER_SERVICE_ID")
+    if not api_key or not service_id:
+        return {"deploys": [], "note": "RENDER_API_KEY / RENDER_SERVICE_ID not set"}
+    try:
+        data = _http_get_json(
+            f"https://api.render.com/v1/services/{service_id}/deploys?limit=20",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+        )
+    except Exception as e:
+        return {"deploys": [], "note": f"Render API error: {e}"}
+    out = []
+    for entry in data or []:
+        d = entry.get("deploy") if isinstance(entry, dict) else None
+        if not d:
+            continue
+        commit = (d.get("commit") or {})
+        out.append({
+            "sha": _short_sha(commit.get("id")),
+            "sha_full": commit.get("id"),
+            "message": (commit.get("message") or "").splitlines()[0] if commit.get("message") else None,
+            "status": _normalize_render_status(d.get("status")),
+            "raw_status": d.get("status"),
+            "created_at": d.get("createdAt"),
+            "effective_at": d.get("finishedAt") or d.get("updatedAt"),
+            "url": None,  # Render dashboard URL would need the team slug
+        })
+    return {"deploys": out, "note": None}
+
+
+def _fetch_vercel_deploys() -> dict:
+    token = os.getenv("VERCEL_TOKEN")
+    project_id = os.getenv("VERCEL_PROJECT_ID")
+    if not token or not project_id:
+        return {"deploys": [], "note": "VERCEL_TOKEN / VERCEL_PROJECT_ID not set"}
+    try:
+        data = _http_get_json(
+            f"https://api.vercel.com/v6/deployments?projectId={project_id}&limit=20",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+        )
+    except Exception as e:
+        return {"deploys": [], "note": f"Vercel API error: {e}"}
+    out = []
+    for d in (data or {}).get("deployments", []) or []:
+        meta = d.get("meta") or {}
+        sha_full = (
+            meta.get("githubCommitSha")
+            or meta.get("gitlabCommitSha")
+            or meta.get("bitbucketCommitSha")
+        )
+        message = meta.get("githubCommitMessage") or meta.get("gitlabCommitMessage")
+        out.append({
+            "sha": _short_sha(sha_full),
+            "sha_full": sha_full,
+            "message": (message or "").splitlines()[0] if message else None,
+            "status": _normalize_vercel_status(d.get("state") or d.get("readyState")),
+            "raw_status": d.get("state") or d.get("readyState"),
+            "created_at": _ms_to_iso(d.get("created")),
+            "effective_at": _ms_to_iso(d.get("ready") or d.get("created")),
+            "url": ("https://" + d["url"]) if d.get("url") else None,
+        })
+    return {"deploys": out, "note": None}
+
+
+@app.get("/api/admin/versions")
+def list_versions(_admin=Depends(current_admin_required)):
+    """FIX414 <panel-app-versions>: deploy history for both halves
+    of the stack. Returns the 20 most recent deploys per platform
+    with a normalized status (live / building / failed)."""
+    return {
+        "backend": _fetch_render_deploys(),
+        "frontend": _fetch_vercel_deploys(),
+    }
+
+
 @app.post("/api/admin/projects/{project_id}/move")
 async def move_admin_project(
     project_id: int,
