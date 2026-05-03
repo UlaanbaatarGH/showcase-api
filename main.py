@@ -219,7 +219,9 @@ def get_me(user=Depends(current_user_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select id, login_name, profile, created_at "
+                # FIX420.4.2.5: surface the user's email so the Contact
+                # panel can pre-fill <msg-reply-addr> when signed in.
+                "select id, login_name, email, profile, created_at "
                 "from app_user where id = %s",
                 (user["id"],),
             )
@@ -833,6 +835,18 @@ async def contact_admin(request: Request):
     subject = (payload.get("subject") or "").strip()
     message = (payload.get("message") or "").strip()
     email = (payload.get("email") or "").strip()
+    # FIX420.4.2.4 <item-selection>: optional list of short labels for
+    # the items the visitor had selected on the Showcase List and kept
+    # ticked. Stored at the head of the message body (so the admin's
+    # forwarded email and the auto-reply both see them) — no separate
+    # column for now.
+    raw_items = payload.get("items")
+    items: list[str] = []
+    if isinstance(raw_items, list):
+        items = [str(x).strip() for x in raw_items if str(x).strip()]
+    if items:
+        items_block = "Selected items:\n" + "\n".join(f"  - {x}" for x in items)
+        message = f"{items_block}\n\n{message}"
     # FIX421.2.1.2: tag the message with the project context it was
     # submitted from so <panel-message-list> can filter per project.
     project_id_raw = payload.get("project_id")
