@@ -88,6 +88,15 @@ app = FastAPI()
 @app.on_event("startup")
 def on_startup():
     pool.open()
+    # FIX521.5.8.0 <item-img-zoom-factor>: stored per-item Zoom Factor.
+    # Idempotent so it's safe to run on every boot.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("alter table folder add column if not exists zoom_factor double precision")
+            conn.commit()
+    except Exception as e:  # pragma: no cover - log and continue
+        print(f"[schema] folder.zoom_factor ensure failed: {e}")
 
 
 @app.on_event("shutdown")
@@ -2668,6 +2677,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   f.note,
                   f.sort_order,
                   f.properties,
+                  f.zoom_factor,
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
                   exists (select 1 from folder_image where folder_id = f.id) as has_image,
@@ -2705,6 +2715,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "has_image": bool(r["has_image"]),
             # FIX500.2.3.2.1.2.2.4 <Image size>: sum of this item's image bytes.
             "image_bytes": int(r["image_bytes"] or 0),
+            # FIX521.5.8.0 <item-img-zoom-factor>: stored item Zoom Factor.
+            "zoom_factor": r["zoom_factor"],
         }
         for r in rows
     ]
@@ -3477,6 +3489,26 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
         except Exception:
             pass
     return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
+
+
+# ============================================================
+# FIX521.5.8.0 / FIX521.5.8.1: store an item's Zoom Factor (max ZF of its
+# images), recomputed client-side whenever its images change.
+# ============================================================
+@app.post("/api/folders/{folder_id}/zoom-factor")
+async def set_folder_zoom_factor(folder_id: int, request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    zf = payload.get("zoom_factor")
+    if zf is not None:
+        try:
+            zf = float(zf)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="zoom_factor must be a number or null")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("update folder set zoom_factor = %s where id = %s", (zf, folder_id))
+        conn.commit()
+    return {"folder_id": folder_id, "zoom_factor": zf}
 
 
 @app.post("/api/images/confirm")
