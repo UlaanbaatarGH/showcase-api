@@ -2670,14 +2670,25 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   f.properties,
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
-                  exists (select 1 from folder_image where folder_id = f.id) as has_image
+                  exists (select 1 from folder_image where folder_id = f.id) as has_image,
+                  -- FIX500.2.3.2.1.2.2.4 <Image size>: total bytes of this item's
+                  -- images, read from storage object metadata (no size column in
+                  -- our image table). Mirrors the per-project Volume aggregate.
+                  coalesce((
+                    select sum((o.metadata->>'size')::bigint)
+                      from folder_image fi2
+                      join image i2 on i2.id = fi2.image_id
+                      left join storage.objects o
+                        on o.bucket_id = %s and o.name = i2.storage_key
+                     where fi2.folder_id = f.id
+                  ), 0) as image_bytes
                 from folder f
                 left join folder_image fi on fi.folder_id = f.id and fi.is_main
                 left join image img       on img.id = fi.image_id
                 where f.project_id = %s
                 order by f.sort_order, f.id
                 """,
-                (project["id"],),
+                (SUPABASE_BUCKET, project["id"]),
             )
             rows = cur.fetchall()
     folders = [
@@ -2692,6 +2703,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             ),
             "main_rotation": r["main_rotation"],
             "has_image": bool(r["has_image"]),
+            # FIX500.2.3.2.1.2.2.4 <Image size>: sum of this item's image bytes.
+            "image_bytes": int(r["image_bytes"] or 0),
         }
         for r in rows
     ]
