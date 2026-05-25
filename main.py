@@ -3544,15 +3544,20 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
             if not row:
                 raise HTTPException(status_code=404, detail="image not found")
             old_key = row["storage_key"]
-            # Versioned key (insert _v{ts} before the extension) so the
-            # immutable CDN cache of the old public URL is bypassed.
-            ts = int(time.time())
+            # Versioned key so the immutable CDN cache of the old public URL is
+            # bypassed. Small incrementing counter (_v1, _v2, ...); never stack —
+            # strip any existing _v<n> before appending the next.
             last = old_key.rsplit("/", 1)[-1]
             if "." in last:
                 base, _, ext = old_key.rpartition(".")
-                new_key = f"{base}_v{ts}.{ext}"
+                dot_ext = "." + ext
             else:
-                new_key = f"{old_key}_v{ts}"
+                base, dot_ext = old_key, ""
+            m = re.search(r"_v(\d+)$", base)
+            n = int(m.group(1)) + 1 if m else 1
+            if m:
+                base = base[: m.start()]
+            new_key = f"{base}_v{n}{dot_ext}"
             upload_to_bucket(new_key, raw, content_type)
             cur.execute("update image set storage_key = %s where id = %s", (new_key, image_id))
         conn.commit()
