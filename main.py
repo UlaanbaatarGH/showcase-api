@@ -3429,6 +3429,56 @@ async def delete_orphan_image(request: Request, user=Depends(current_user_requir
     return {"deleted": True}
 
 
+# ============================================================
+# FIX521.3.5 <button-shrink-image-list>: replace an image's stored bytes
+# with a client-shrunk version.
+# ============================================================
+@app.post("/api/images/{image_id}/replace-bytes")
+async def replace_image_bytes(image_id: int, request: Request, user=Depends(current_user_required)):
+    """FIX521.3.5.2: overwrite an image's stored bytes with a client-provided
+    (shrunk) version. Writes a NEW versioned storage key — the public URL is
+    served with an immutable 1-year cache, so reusing the old key would keep
+    serving the old bytes — repoints the image row, then deletes the old object
+    so the shrink actually frees storage. Returns the new url + byte size."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="bucket uploads not configured")
+    payload = await request.json()
+    content_type = payload.get("content_type") or "image/jpeg"
+    try:
+        raw = base64.b64decode(payload.get("data_base64") or "", validate=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"could not decode image data: {e}")
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty image data")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select storage_key from image where id = %s", (image_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="image not found")
+            old_key = row["storage_key"]
+            # Versioned key (insert _v{ts} before the extension) so the
+            # immutable CDN cache of the old public URL is bypassed.
+            ts = int(time.time())
+            last = old_key.rsplit("/", 1)[-1]
+            if "." in last:
+                base, _, ext = old_key.rpartition(".")
+                new_key = f"{base}_v{ts}.{ext}"
+            else:
+                new_key = f"{old_key}_v{ts}"
+            upload_to_bucket(new_key, raw, content_type)
+            cur.execute("update image set storage_key = %s where id = %s", (new_key, image_id))
+        conn.commit()
+    # Best-effort delete of the old object (after commit, so a delete failure
+    # can't undo the repoint). This is what makes the shrink free storage.
+    if old_key and old_key != new_key:
+        try:
+            _bucket_delete(old_key)
+        except Exception:
+            pass
+    return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
+
+
 @app.post("/api/images/confirm")
 async def confirm_image(request: Request, user=Depends(current_user_required)):
     payload = await request.json()
