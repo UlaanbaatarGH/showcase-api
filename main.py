@@ -9,6 +9,8 @@ import secrets
 import traceback
 import mimetypes
 import unicodedata
+import io
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
@@ -84,6 +86,76 @@ pool = ConnectionPool(
 
 app = FastAPI()
 
+# FIX521.5.7.1: Reference Viewport (hardcoded; matches src/zoom.js).
+REF_VIEWPORT_W, REF_VIEWPORT_H = 1920, 911
+
+
+def _image_dims_from_url(url):
+    """Read an image's pixel size. Tries a header-sized range first to avoid
+    downloading whole images, falling back to the full object. Returns (w, h)
+    or None. Pillow is imported lazily so a missing dep can't break startup."""
+    from PIL import Image  # lazy: optional dependency, only needed for backfill
+    for byte_range in (262144, None):
+        try:
+            headers = {"User-Agent": "showcase-zoom-backfill"}
+            if byte_range:
+                headers["Range"] = f"bytes=0-{byte_range - 1}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            with Image.open(io.BytesIO(data)) as im:
+                return im.width, im.height
+        except Exception:
+            continue
+    return None
+
+
+def _backfill_zoom_factors():
+    """FIX521.5.8.0 / FIX521.5.8.1 backfill: for items whose Zoom Factor isn't
+    stored yet, read their images' dimensions and store the item's max ZF
+    (max(W/RVw, H/RVh)). Runs in a background thread on startup; only touches
+    folders with images and a NULL zoom_factor, so it self-limits over reboots."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    select f.id as folder_id, i.storage_key
+                      from folder f
+                      join folder_image fi on fi.folder_id = f.id
+                      join image i on i.id = fi.image_id
+                     where f.zoom_factor is null
+                    """
+                )
+                rows = cur.fetchall()
+        by_folder = {}
+        for r in rows:
+            by_folder.setdefault(r["folder_id"], []).append(r["storage_key"])
+        if by_folder:
+            print(f"[backfill-zoom] computing {len(by_folder)} items")
+        for folder_id, keys in by_folder.items():
+            max_zf = 0.0
+            for k in keys:
+                dims = _image_dims_from_url(public_image_url(k))
+                if not dims:
+                    continue
+                w, h = dims
+                zf = max(w / REF_VIEWPORT_W, h / REF_VIEWPORT_H)
+                if zf > max_zf:
+                    max_zf = zf
+            if max_zf > 0:
+                with pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "update folder set zoom_factor = %s where id = %s and zoom_factor is null",
+                            (max_zf, folder_id),
+                        )
+                    conn.commit()
+        if by_folder:
+            print("[backfill-zoom] done")
+    except Exception as e:  # pragma: no cover - log and continue
+        print(f"[backfill-zoom] failed: {e}")
+
 
 @app.on_event("startup")
 def on_startup():
@@ -97,6 +169,9 @@ def on_startup():
             conn.commit()
     except Exception as e:  # pragma: no cover - log and continue
         print(f"[schema] folder.zoom_factor ensure failed: {e}")
+    # FIX521.5.8.0 / FIX521.5.8.1: backfill stored Zoom Factors in the
+    # background so boot isn't blocked. Self-limits to NULL-zoom items.
+    threading.Thread(target=_backfill_zoom_factors, daemon=True).start()
 
 
 @app.on_event("shutdown")
