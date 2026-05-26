@@ -111,48 +111,60 @@ def _image_dims_from_url(url):
 
 
 def _backfill_zoom_factors():
-    """FIX521.5.8.0 / FIX521.5.8.1 backfill: for items whose Zoom Factor isn't
-    stored yet, read their images' dimensions and store the item's max ZF
-    (max(W/RVw, H/RVh)). Runs in a background thread on startup; only touches
-    folders with images and a NULL zoom_factor, so it self-limits over reboots."""
+    """FIX521.5.8.1 backfill: populate stored Zoom Factors that are still NULL.
+
+    (1) <img-zoom-factor>: for each image with no stored ZF, read its pixel
+        dimensions and store image.zoom_factor = max(W/RVw, H/RVh).
+    (2) <item-img-zoom-factor>: for each item (folder) with no stored ZF, set
+        folder.zoom_factor to the max of its images' now-stored ZF.
+
+    Runs in a background thread on startup; self-limits to NULL rows so it
+    converges over reboots and is safe to re-run (idempotent migration)."""
     try:
+        # (1) per-image ZF — the data migration over all images missing it.
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("select id, storage_key from image where zoom_factor is null")
+                imgs = cur.fetchall()
+        if imgs:
+            print(f"[backfill-zoom] measuring {len(imgs)} images")
+        measured = 0
+        for r in imgs:
+            dims = _image_dims_from_url(public_image_url(r["storage_key"]))
+            if not dims:
+                continue
+            w, h = dims
+            zf = max(w / REF_VIEWPORT_W, h / REF_VIEWPORT_H)
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "update image set zoom_factor = %s where id = %s and zoom_factor is null",
+                        (zf, r["id"]),
+                    )
+                conn.commit()
+            measured += 1
+        # (2) per-item max ZF, derived from the stored per-image ZF (no extra
+        #     downloads). Only fills folders that don't have one yet.
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select f.id as folder_id, i.storage_key
-                      from folder f
-                      join folder_image fi on fi.folder_id = f.id
-                      join image i on i.id = fi.image_id
-                     where f.zoom_factor is null
+                    update folder f
+                       set zoom_factor = sub.max_zf
+                      from (
+                            select fi.folder_id, max(i.zoom_factor) as max_zf
+                              from folder_image fi
+                              join image i on i.id = fi.image_id
+                             group by fi.folder_id
+                           ) sub
+                     where f.id = sub.folder_id
+                       and f.zoom_factor is null
+                       and sub.max_zf is not null
                     """
                 )
-                rows = cur.fetchall()
-        by_folder = {}
-        for r in rows:
-            by_folder.setdefault(r["folder_id"], []).append(r["storage_key"])
-        if by_folder:
-            print(f"[backfill-zoom] computing {len(by_folder)} items")
-        for folder_id, keys in by_folder.items():
-            max_zf = 0.0
-            for k in keys:
-                dims = _image_dims_from_url(public_image_url(k))
-                if not dims:
-                    continue
-                w, h = dims
-                zf = max(w / REF_VIEWPORT_W, h / REF_VIEWPORT_H)
-                if zf > max_zf:
-                    max_zf = zf
-            if max_zf > 0:
-                with pool.connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "update folder set zoom_factor = %s where id = %s and zoom_factor is null",
-                            (max_zf, folder_id),
-                        )
-                    conn.commit()
-        if by_folder:
-            print("[backfill-zoom] done")
+            conn.commit()
+        if imgs:
+            print(f"[backfill-zoom] done ({measured}/{len(imgs)} images measured)")
     except Exception as e:  # pragma: no cover - log and continue
         print(f"[backfill-zoom] failed: {e}")
 
