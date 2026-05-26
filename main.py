@@ -3870,8 +3870,8 @@ async def delete_folder_image(
     return {"deleted": True, "image_deleted": storage_key_to_drop is not None}
 
 
-# FIX520.2.10 (Showcase image viewer toolbox) non-destructive save: update
-# crop rectangle and/or rotation on the Image row. The physical asset in
+# FIX501.4.4.10 non-destructive save: update crop rectangle and/or rotation
+# on the Image row. The physical asset in
 # the bucket is never touched — the viewer composes the final pixels at
 # render time from storage_key + rotation + crop.
 @app.patch("/api/images/{image_id}")
