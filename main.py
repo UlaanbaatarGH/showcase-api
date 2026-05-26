@@ -2679,7 +2679,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 # project resolves it, so URLs from before a rename
                 # keep working as long as their slug stays active.
                 cur.execute(
-                    "select p.id, p.name, p.view_setup, "
+                    "select p.id, p.name, p.is_public, p.view_setup, "
                     "       p.front_introduction, p.introduction, "
                     "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
@@ -2710,7 +2710,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     raise HTTPException(status_code=404, detail="project not found")
             else:
                 cur.execute(
-                    "select id, name, view_setup, "
+                    "select id, name, is_public, view_setup, "
                     "       front_introduction, introduction, "
                     "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project "
@@ -2813,6 +2813,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
         "project": {
             "id": project["id"],
             "name": project["name"],
+            # FIX404.1.1: gates the item deep-link (only public projects).
+            "is_public": bool(project.get("is_public")),
             "is_admin_or_manager": is_admin_or_manager,
             # FIX352.2.6 / FIX503.3.5: surface the introduction so the
             # ShowcaseView About popup can render it. front_introduction
