@@ -161,14 +161,16 @@ def _backfill_zoom_factors():
 def on_startup():
     pool.open()
     # FIX521.5.8.0 <item-img-zoom-factor>: stored per-item Zoom Factor.
+    # FIX521.5.8.1 <img-zoom-factor>: stored per-image Zoom Factor.
     # Idempotent so it's safe to run on every boot.
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("alter table folder add column if not exists zoom_factor double precision")
+                cur.execute("alter table image add column if not exists zoom_factor double precision")
             conn.commit()
     except Exception as e:  # pragma: no cover - log and continue
-        print(f"[schema] folder.zoom_factor ensure failed: {e}")
+        print(f"[schema] zoom_factor ensure failed: {e}")
     # FIX521.5.8.0 / FIX521.5.8.1: backfill stored Zoom Factors in the
     # background so boot isn't blocked. Self-limits to NULL-zoom items.
     threading.Thread(target=_backfill_zoom_factors, daemon=True).start()
@@ -3531,6 +3533,14 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
         raise HTTPException(status_code=503, detail="bucket uploads not configured")
     payload = await request.json()
     content_type = payload.get("content_type") or "image/jpeg"
+    # FIX521.5.8.1 <img-zoom-factor>: shrinking changes the pixel dims, so the
+    # client recomputes the image's ZF and sends it to be re-stored. Optional.
+    zoom_factor = payload.get("zoom_factor")
+    if zoom_factor is not None:
+        try:
+            zoom_factor = float(zoom_factor)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="zoom_factor must be a number or null")
     try:
         raw = base64.b64decode(payload.get("data_base64") or "", validate=False)
     except Exception as e:
@@ -3559,7 +3569,10 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
                 base = base[: m.start()]
             new_key = f"{base}_v{n}{dot_ext}"
             upload_to_bucket(new_key, raw, content_type)
-            cur.execute("update image set storage_key = %s where id = %s", (new_key, image_id))
+            cur.execute(
+                "update image set storage_key = %s, zoom_factor = %s where id = %s",
+                (new_key, zoom_factor, image_id),
+            )
         conn.commit()
     # Best-effort delete of the old object (after commit, so a delete failure
     # can't undo the repoint). This is what makes the shrink free storage.
@@ -3600,6 +3613,15 @@ async def confirm_image(request: Request, user=Depends(current_user_required)):
     sort_order = payload.get("sort_order", 0)
     caption = payload.get("caption")
     replaces_image_id = payload.get("replaces_image_id")
+    # FIX371.6.3 / FIX521.5.8.1 <img-zoom-factor>: the client computes the
+    # image's ZF from its pixel dims (against the Reference Viewport) and sends
+    # it here so it's stored on the image row at creation. Optional / nullable.
+    zoom_factor = payload.get("zoom_factor")
+    if zoom_factor is not None:
+        try:
+            zoom_factor = float(zoom_factor)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="zoom_factor must be a number or null")
     if not project_id or not item_name or not storage_key:
         raise HTTPException(status_code=400, detail="project_id, item_name, storage_key required")
 
@@ -3635,8 +3657,8 @@ async def confirm_image(request: Request, user=Depends(current_user_required)):
                 folder_id = cur.fetchone()["id"]
 
             cur.execute(
-                "insert into image (storage_key) values (%s) returning id",
-                (storage_key,),
+                "insert into image (storage_key, zoom_factor) values (%s, %s) returning id",
+                (storage_key, zoom_factor),
             )
             image_id = cur.fetchone()["id"]
 
@@ -3674,7 +3696,8 @@ def list_folder_images(folder_id: int):
                   img.id          as image_id,
                   img.storage_key,
                   img.rotation,
-                  img.crop
+                  img.crop,
+                  img.zoom_factor
                 from folder_image fi
                 join image img on img.id = fi.image_id
                 where fi.folder_id = %s
@@ -3698,6 +3721,8 @@ def list_folder_images(folder_id: int):
             "url": public_image_url(r["storage_key"]),
             "rotation": r["rotation"],
             "crop": r["crop"],
+            # FIX521.5.8.1 <img-zoom-factor>: stored per-image Zoom Factor.
+            "zoom_factor": r["zoom_factor"],
         }
         for r in rows
     ]
