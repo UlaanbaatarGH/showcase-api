@@ -99,7 +99,9 @@ def collect_keys(conn):
 
 
 def main():
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    # prepare_threshold=None: Supabase's pooler (pgBouncer, transaction mode)
+    # doesn't support server-side prepared statements across pooled connections.
+    conn = psycopg.connect(DATABASE_URL, autocommit=True, prepare_threshold=None)
 
     # Ensure the size column exists (idempotent).
     if not DRY_RUN:
