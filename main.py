@@ -16,6 +16,8 @@ from datetime import datetime
 from typing import Optional
 import urllib.request
 import urllib.error
+import boto3
+from botocore.config import Config
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -30,6 +32,36 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "showcase-images")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # required for /api/publish
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # required for authenticated endpoints
+
+# Cloudflare R2 (S3-compatible) — image object storage. The database and auth
+# stay in Supabase; only image FILES live in R2. Public reads come from
+# R2_PUBLIC_BASE (the bucket's r2.dev URL or a custom domain).
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT")  # https://<account>.r2.cloudflarestorage.com
+R2_BUCKET = os.environ.get("R2_BUCKET", "showcase-images")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "").rstrip("/")  # https://pub-xxxx.r2.dev
+
+_s3_client = None
+
+
+def s3():
+    """Lazily-built S3 client pointed at R2. Raises 503 if R2 isn't configured."""
+    global _s3_client
+    if _s3_client is None:
+        if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
+            raise HTTPException(status_code=503, detail="R2 storage not configured")
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+            config=Config(signature_version="s3v4"),
+        )
+    return _s3_client
+
+
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,https://showcase.x22.fr,https://showcase-omega-jade.vercel.app",
@@ -37,38 +69,21 @@ ALLOWED_ORIGINS = os.environ.get(
 
 
 def public_image_url(storage_key: str) -> str:
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_key}"
+    return f"{R2_PUBLIC_BASE}/{storage_key}"
 
 
 def upload_to_bucket(storage_key: str, data: bytes, content_type: str) -> None:
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="Bucket uploads disabled: SUPABASE_SERVICE_ROLE_KEY not set",
-        )
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_key}"
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Content-Type": content_type or "application/octet-stream",
-            "x-upsert": "true",
-            "Cache-Control": "public, max-age=31536000, immutable",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Bucket upload failed ({e.code}): {body[:500]}",
+        s3().put_object(
+            Bucket=R2_BUCKET,
+            Key=storage_key,
+            Body=data,
+            ContentType=content_type or "application/octet-stream",
+            CacheControl="public, max-age=31536000, immutable",
         )
-    except urllib.error.URLError as e:
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"Bucket upload error: {e}")
 
 pool = ConnectionPool(
@@ -1496,19 +1511,16 @@ def list_admin_projects(user=Depends(current_user_required)):
             cur.execute(
                 """
                 with proj_imgs as (
-                    select distinct f.project_id, i.storage_key
+                    select distinct f.project_id, i.id as image_id, i.bytes
                       from image i
                       join folder_image fi on fi.image_id = i.id
                       join folder f       on f.id = fi.folder_id
                 )
-                select pi.project_id,
-                       coalesce(sum((o.metadata->>'size')::bigint), 0) as bytes
-                  from proj_imgs pi
-                  left join storage.objects o
-                    on o.bucket_id = %s and o.name = pi.storage_key
-                 group by pi.project_id
+                select project_id,
+                       coalesce(sum(bytes), 0) as bytes
+                  from proj_imgs
+                 group by project_id
                 """,
-                (SUPABASE_BUCKET,),
             )
             bytes_rows = cur.fetchall()
     bytes_by_proj = {r["project_id"]: int(r["bytes"] or 0) for r in bytes_rows}
@@ -2618,27 +2630,16 @@ async def sign_project_cover_upload(
         f"p{int(project_id)}/_cover/{base}_{timestamp}.{ext}"
         if ext else f"p{int(project_id)}/_cover/{base}_{timestamp}"
     )
-    url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
-    req = urllib.request.Request(
-        url,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Content-Type": "application/json",
-        },
-        data=b"{}",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(status_code=502, detail=f"Supabase sign failed: {body[:200]}")
-    except urllib.error.URLError as e:
-        raise HTTPException(status_code=502, detail=f"Supabase sign failed: {e}")
-    signed_path = result.get("url") or ""
-    signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+        signed_url = s3().generate_presigned_url(
+            "put_object",
+            Params={"Bucket": R2_BUCKET, "Key": storage_key},
+            ExpiresIn=600,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sign upload failed: {e}")
     return {"storage_key": storage_key, "signed_url": signed_url}
 
 
@@ -2771,14 +2772,11 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   img.rotation    as main_rotation,
                   exists (select 1 from folder_image where folder_id = f.id) as has_image,
                   -- FIX500.2.3.2.1.2.2.4 <Image size>: total bytes of this item's
-                  -- images, read from storage object metadata (no size column in
-                  -- our image table). Mirrors the per-project Volume aggregate.
+                  -- images, summed from the image table's stored byte size.
                   coalesce((
-                    select sum((o.metadata->>'size')::bigint)
+                    select sum(i2.bytes)
                       from folder_image fi2
                       join image i2 on i2.id = fi2.image_id
-                      left join storage.objects o
-                        on o.bucket_id = %s and o.name = i2.storage_key
                      where fi2.folder_id = f.id
                   ), 0) as image_bytes
                 from folder f
@@ -2787,7 +2785,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 where f.project_id = %s
                 order by f.sort_order, f.id
                 """,
-                (SUPABASE_BUCKET, project["id"]),
+                (project["id"],),
             )
             rows = cur.fetchall()
     folders = [
@@ -3333,36 +3331,33 @@ async def publish_folder(request: Request):
 # ============================================================
 @app.get("/api/projects/{project_id}/storage-size")
 def storage_size(project_id: int):
-    """Return the total bytes consumed in Supabase Storage by all images
-    linked to folders of this project. Reads `storage.objects.metadata`
-    (managed by Supabase Storage) so old uploads count too — no per-image
-    size column is needed in our `image` table.
+    """Return the total bytes consumed by all images linked to folders of this
+    project, summed from the image table's stored byte size (`image.bytes`,
+    recorded at upload/shrink and backfilled at the R2 migration).
     Returns: { bytes, image_count, missing_count }
-      - bytes: sum of file sizes for matched objects
-      - image_count: total folder_image rows for this project
-      - missing_count: image rows with no matching storage object (e.g.
-        upload pending or storage_key drift)
+      - bytes: sum of stored file sizes
+      - image_count: distinct images linked to this project
+      - missing_count: image rows with no recorded size (upload never
+        completed, or not yet migrated)
     """
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                 with proj_imgs as (
-                    select i.id as image_id, i.storage_key
+                    select distinct i.id as image_id, i.bytes
                       from image i
                       join folder_image fi on fi.image_id = i.id
                       join folder f       on f.id = fi.folder_id
                      where f.project_id = %s
                 )
                 select
-                  coalesce(sum((o.metadata->>'size')::bigint), 0) as bytes,
-                  count(distinct pi.image_id)                      as image_count,
-                  count(distinct pi.image_id) filter (where o.id is null) as missing_count
-                from proj_imgs pi
-                left join storage.objects o
-                  on o.bucket_id = %s and o.name = pi.storage_key
+                  coalesce(sum(bytes), 0) as bytes,
+                  count(*) as image_count,
+                  count(*) filter (where bytes is null) as missing_count
+                from proj_imgs
                 """,
-                (project_id, SUPABASE_BUCKET),
+                (project_id,),
             )
             row = cur.fetchone() or {}
     return {
@@ -3413,30 +3408,14 @@ def _sanitize_path_segment(s: str) -> str:
 
 
 def _bucket_delete(storage_key: str) -> None:
-    """Delete a single object from the bucket. 404 is treated as success
+    """Delete a single object from R2. A missing object is treated as success
     (already gone). Raises HTTPException on any other failure."""
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=503, detail="bucket access not configured")
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_key}"
-    req = urllib.request.Request(
-        url,
-        method="DELETE",
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return
-        body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Bucket delete failed ({e.code}): {body[:200]}",
-        )
+        s3().delete_object(Bucket=R2_BUCKET, Key=storage_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Bucket delete error: {e}")
 
 
 def _has_image_row(storage_key: str) -> bool:
@@ -3451,8 +3430,6 @@ def _has_image_row(storage_key: str) -> bool:
 
 @app.post("/api/images/sign-upload")
 async def sign_upload(request: Request, user=Depends(current_user_required)):
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=503, detail="bucket uploads not configured")
     payload = await request.json()
     project_id = payload.get("project_id")
     item_name = payload.get("item_name") or ""
@@ -3464,50 +3441,23 @@ async def sign_upload(request: Request, user=Depends(current_user_required)):
         f"{_sanitize_path_segment(item_name)}/"
         f"{_sanitize_path_segment(filename)}"
     )
-
-    def _request_signed_upload():
-        url = f"{SUPABASE_URL}/storage/v1/object/upload/sign/{SUPABASE_BUCKET}/{storage_key}"
-        req = urllib.request.Request(
-            url,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Content-Type": "application/json",
-            },
-            data=b"{}",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-
+    # FIX371: refuse to hand out an upload URL for a key already backing a live
+    # image — real updates go through replaces_image_id, not a silent overwrite.
+    # An orphan object (no image row) is fine: the presigned PUT just overwrites it.
+    if _has_image_row(storage_key):
+        raise HTTPException(status_code=409, detail="storage_key already backs an image")
+    # S3 presigned PUT. ContentType is intentionally NOT signed, so the client's
+    # own Content-Type header is accepted (and stored) without a signature mismatch.
     try:
-        result = _request_signed_upload()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        # FIX371 orphan recovery: when the bucket says the object already
-        # exists but no image row references it, the file is an orphan
-        # from a previous failed upload (e.g. PUT succeeded but confirm
-        # never ran). Delete the orphan and retry the sign once. If a
-        # row DOES exist, the key is in legitimate use — surface the
-        # error so the caller doesn't overwrite live data.
-        is_dup = '"statusCode":"409"' in body or '"Duplicate"' in body
-        if is_dup and not _has_image_row(storage_key):
-            _bucket_delete(storage_key)
-            try:
-                result = _request_signed_upload()
-            except urllib.error.HTTPError as e2:
-                body2 = e2.read().decode("utf-8", errors="replace")
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Sign upload failed after orphan cleanup ({e2.code}): {body2[:200]}",
-                )
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Sign upload failed ({e.code}): {body[:300]}",
-            )
-    signed_path = result.get("url") or ""
-    signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+        signed_url = s3().generate_presigned_url(
+            "put_object",
+            Params={"Bucket": R2_BUCKET, "Key": storage_key},
+            ExpiresIn=600,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sign upload failed: {e}")
     return {"storage_key": storage_key, "signed_url": signed_url}
 
 
@@ -3584,8 +3534,8 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
             new_key = f"{base}_v{n}{dot_ext}"
             upload_to_bucket(new_key, raw, content_type)
             cur.execute(
-                "update image set storage_key = %s, zoom_factor = %s where id = %s",
-                (new_key, zoom_factor, image_id),
+                "update image set storage_key = %s, zoom_factor = %s, bytes = %s where id = %s",
+                (new_key, zoom_factor, len(raw), image_id),
             )
         conn.commit()
     # Best-effort delete of the old object (after commit, so a delete failure
@@ -3670,9 +3620,16 @@ async def confirm_image(request: Request, user=Depends(current_user_required)):
                 )
                 folder_id = cur.fetchone()["id"]
 
+            # Record the stored byte size (read from R2) so the size stats
+            # don't depend on the storage backend's own metadata tables.
+            try:
+                head = s3().head_object(Bucket=R2_BUCKET, Key=storage_key)
+                obj_bytes = int(head.get("ContentLength") or 0)
+            except Exception:
+                obj_bytes = None
             cur.execute(
-                "insert into image (storage_key, zoom_factor) values (%s, %s) returning id",
-                (storage_key, zoom_factor),
+                "insert into image (storage_key, zoom_factor, bytes) values (%s, %s, %s) returning id",
+                (storage_key, zoom_factor, obj_bytes),
             )
             image_id = cur.fetchone()["id"]
 
