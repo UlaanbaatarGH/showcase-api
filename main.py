@@ -57,7 +57,12 @@ def s3():
             aws_access_key_id=R2_ACCESS_KEY_ID,
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
             region_name="auto",
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=5,
+                read_timeout=15,
+                retries={"max_attempts": 2},
+            ),
         )
     return _s3_client
 
@@ -3448,15 +3453,18 @@ async def sign_upload(request: Request, user=Depends(current_user_required)):
         raise HTTPException(status_code=409, detail="storage_key already backs an image")
     # S3 presigned PUT. ContentType is intentionally NOT signed, so the client's
     # own Content-Type header is accepted (and stored) without a signature mismatch.
+    print(f"[r2] sign-upload key={storage_key}", flush=True)
     try:
         signed_url = s3().generate_presigned_url(
             "put_object",
             Params={"Bucket": R2_BUCKET, "Key": storage_key},
             ExpiresIn=600,
         )
+        print(f"[r2] sign-upload OK key={storage_key}", flush=True)
     except HTTPException:
         raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Sign upload failed: {e}")
     return {"storage_key": storage_key, "signed_url": signed_url}
 
@@ -3625,7 +3633,9 @@ async def confirm_image(request: Request, user=Depends(current_user_required)):
             try:
                 head = s3().head_object(Bucket=R2_BUCKET, Key=storage_key)
                 obj_bytes = int(head.get("ContentLength") or 0)
-            except Exception:
+                print(f"[r2] confirm head key={storage_key} bytes={obj_bytes}", flush=True)
+            except Exception as e:
+                print(f"[r2] confirm head FAILED key={storage_key}: {e}", flush=True)
                 obj_bytes = None
             cur.execute(
                 "insert into image (storage_key, zoom_factor, bytes) values (%s, %s, %s) returning id",
