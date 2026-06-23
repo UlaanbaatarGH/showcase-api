@@ -2787,7 +2787,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 from folder f
                 left join folder_image fi on fi.folder_id = f.id and fi.is_main
                 left join image img       on img.id = fi.image_id
-                where f.project_id = %s
+                where f.project_id = %s and not f.is_master
                 order by f.sort_order, f.id
                 """,
                 (project["id"],),
