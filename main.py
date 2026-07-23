@@ -3576,6 +3576,122 @@ async def set_folder_zoom_factor(folder_id: int, request: Request, user=Depends(
     return {"folder_id": folder_id, "zoom_factor": zf}
 
 
+# ============================================================
+# FIX610.3.20: Website/Local app concurrent access — a per-project edit
+# lock over <panel-showcase-img-list-editor>, held via a heartbeat lease.
+# "active" is computed in SQL (now() - last_heartbeat_at within the TTL) so
+# a crashed/closed tab that stopped heartbeating is treated as released
+# without needing an explicit /release call. local_pending_changes tracks
+# whether the local app has any staged (non-blank status) image change not
+# yet published, independent of whether its editor is currently open
+# (FIX610.3.20.2) — set by the client on every status change, not tied to
+# acquire/release.
+# ============================================================
+EDIT_LOCK_TTL_SECONDS = 45
+
+
+@app.get("/api/projects/{project_id}/edit-lock")
+def get_edit_lock(project_id: int, user=Depends(current_user_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"select holder, local_pending_changes, "
+                f"(holder is not null and last_heartbeat_at is not null "
+                f" and now() - last_heartbeat_at <= interval '{EDIT_LOCK_TTL_SECONDS} seconds') as active "
+                f"from project_edit_lock where project_id = %s",
+                (project_id,),
+            )
+            row = cur.fetchone()
+    return {
+        "holder": (row["holder"] if row and row["active"] else None),
+        "local_pending_changes": bool(row and row["local_pending_changes"]),
+    }
+
+
+@app.post("/api/projects/{project_id}/edit-lock/acquire")
+async def acquire_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    holder = payload.get("holder")
+    session_token = payload.get("session_token")
+    if holder not in ("local", "website") or not session_token:
+        raise HTTPException(status_code=400, detail="holder ('local'|'website') and session_token are required")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"select holder, session_token, local_pending_changes, "
+                f"(holder is not null and last_heartbeat_at is not null "
+                f" and now() - last_heartbeat_at <= interval '{EDIT_LOCK_TTL_SECONDS} seconds') as active "
+                f"from project_edit_lock where project_id = %s for update",
+                (project_id,),
+            )
+            row = cur.fetchone()
+            # FIX610.3.20.1: the other side already has an active lease.
+            if row and row["active"] and row["holder"] != holder and row["session_token"] != session_token:
+                raise HTTPException(status_code=409, detail=f"locked by {row['holder']}")
+            # FIX610.3.20.2: website may not open while the local app has
+            # unpublished pending changes anywhere in the project.
+            if holder == "website" and row and row["local_pending_changes"]:
+                raise HTTPException(status_code=409, detail="local app has unpublished changes pending")
+            cur.execute(
+                "insert into project_edit_lock (project_id, holder, session_token, last_heartbeat_at) "
+                "values (%s, %s, %s, now()) "
+                "on conflict (project_id) do update set holder = excluded.holder, "
+                "session_token = excluded.session_token, last_heartbeat_at = excluded.last_heartbeat_at",
+                (project_id, holder, session_token),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/edit-lock/heartbeat")
+async def heartbeat_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    session_token = payload.get("session_token")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "update project_edit_lock set last_heartbeat_at = now() "
+                "where project_id = %s and session_token = %s returning project_id",
+                (project_id, session_token),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=409, detail="lock not held by this session")
+    return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/edit-lock/release")
+async def release_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    session_token = payload.get("session_token")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "update project_edit_lock set holder = null, session_token = null, last_heartbeat_at = null "
+                "where project_id = %s and session_token = %s",
+                (project_id, session_token),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/edit-lock/pending-changes")
+async def set_edit_lock_pending_changes(project_id: int, request: Request, user=Depends(current_user_required)):
+    payload = await request.json()
+    pending = bool(payload.get("pending"))
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "insert into project_edit_lock (project_id, local_pending_changes) "
+                "values (%s, %s) "
+                "on conflict (project_id) do update set local_pending_changes = excluded.local_pending_changes",
+                (project_id, pending),
+            )
+        conn.commit()
+    return {"ok": True}
+
+
 @app.post("/api/images/confirm")
 async def confirm_image(request: Request, user=Depends(current_user_required)):
     payload = await request.json()
