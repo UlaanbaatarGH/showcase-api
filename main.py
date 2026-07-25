@@ -3585,13 +3585,17 @@ async def set_folder_zoom_factor(folder_id: int, request: Request, user=Depends(
 # whether the local app has any staged (non-blank status) image change not
 # yet published, independent of whether its editor is currently open
 # (FIX610.3.20.2) — set by the client on every status change, not tied to
-# acquire/release.
+# acquire/release. No auth dependency here: the website already gates
+# <button-edit> to logged-in users before it ever calls these, and the
+# local app has no login process at all, same as every other local-only
+# endpoint — holder identity comes from the explicit 'local'/'website'
+# payload field, not from a token.
 # ============================================================
 EDIT_LOCK_TTL_SECONDS = 45
 
 
 @app.get("/api/projects/{project_id}/edit-lock")
-def get_edit_lock(project_id: int, user=Depends(current_user_required)):
+def get_edit_lock(project_id: int):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -3609,7 +3613,7 @@ def get_edit_lock(project_id: int, user=Depends(current_user_required)):
 
 
 @app.post("/api/projects/{project_id}/edit-lock/acquire")
-async def acquire_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+async def acquire_edit_lock(project_id: int, request: Request):
     payload = await request.json()
     holder = payload.get("holder")
     session_token = payload.get("session_token")
@@ -3644,7 +3648,7 @@ async def acquire_edit_lock(project_id: int, request: Request, user=Depends(curr
 
 
 @app.post("/api/projects/{project_id}/edit-lock/heartbeat")
-async def heartbeat_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+async def heartbeat_edit_lock(project_id: int, request: Request):
     payload = await request.json()
     session_token = payload.get("session_token")
     with pool.connection() as conn:
@@ -3662,7 +3666,7 @@ async def heartbeat_edit_lock(project_id: int, request: Request, user=Depends(cu
 
 
 @app.post("/api/projects/{project_id}/edit-lock/release")
-async def release_edit_lock(project_id: int, request: Request, user=Depends(current_user_required)):
+async def release_edit_lock(project_id: int, request: Request):
     payload = await request.json()
     session_token = payload.get("session_token")
     with pool.connection() as conn:
@@ -3677,7 +3681,7 @@ async def release_edit_lock(project_id: int, request: Request, user=Depends(curr
 
 
 @app.post("/api/projects/{project_id}/edit-lock/pending-changes")
-async def set_edit_lock_pending_changes(project_id: int, request: Request, user=Depends(current_user_required)):
+async def set_edit_lock_pending_changes(project_id: int, request: Request):
     payload = await request.json()
     pending = bool(payload.get("pending"))
     with pool.connection() as conn:
