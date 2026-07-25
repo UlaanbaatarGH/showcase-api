@@ -3434,7 +3434,12 @@ def _has_image_row(storage_key: str) -> bool:
 
 
 @app.post("/api/images/sign-upload")
-async def sign_upload(request: Request, user=Depends(current_user_required)):
+# No auth dependency (dropped alongside the FIX610.3.20 edit-lock
+# endpoints, same rationale): the local app's Publish flow has no login
+# process and was 401ing here on every new image. ImportImagesDialog
+# (website, admin-only) still gates via the UI's <button-edit>/admin
+# check, not via a backend token — same posture as the rest of this file.
+async def sign_upload(request: Request):
     payload = await request.json()
     project_id = payload.get("project_id")
     item_name = payload.get("item_name") or ""
@@ -3697,7 +3702,7 @@ async def set_edit_lock_pending_changes(project_id: int, request: Request):
 
 
 @app.post("/api/images/confirm")
-async def confirm_image(request: Request, user=Depends(current_user_required)):
+async def confirm_image(request: Request):
     payload = await request.json()
     project_id = payload.get("project_id")
     item_name = (payload.get("item_name") or "").strip()
