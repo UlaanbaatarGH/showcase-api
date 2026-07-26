@@ -2564,10 +2564,16 @@ async def update_project(
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="project not found")
-            # Allow: owner, or anyone if the project is still unowned — in
-            # which case we auto-claim ownership below so subsequent edits
-            # stick to this user.
-            if row["owner_id"] is not None and row["owner_id"] != user["id"]:
+            # Allow: a global admin (regardless of owner_id — an orphaned or
+            # mismatched owner_id must never lock an admin out; "who's logged
+            # into the app" is what matters, not which identity happens to
+            # be recorded as owner), the owner, or anyone if the project is
+            # still unowned — in which case we auto-claim ownership below so
+            # subsequent edits stick to this user.
+            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            pr = cur.fetchone()
+            is_admin = bool(pr and pr["profile"] == "admin")
+            if not is_admin and row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
             auto_claim = row["owner_id"] is None
 
@@ -2631,9 +2637,15 @@ async def sign_project_cover_upload(
             if not row:
                 raise HTTPException(status_code=404, detail="project not found")
             # Same relaxed owner check as PATCH — unowned projects can be
-            # edited by any signed-in user. The PATCH that follows will
-            # auto-claim ownership on save.
-            if row["owner_id"] is not None and row["owner_id"] != user["id"]:
+            # edited by any signed-in user (the PATCH that follows will
+            # auto-claim ownership on save), and a global admin always
+            # passes regardless of owner_id (see PATCH /api/projects/:id
+            # for why: an orphaned/mismatched owner_id must never lock an
+            # admin out).
+            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            pr = cur.fetchone()
+            is_admin = bool(pr and pr["profile"] == "admin")
+            if not is_admin and row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
 
     # Versioned key so browser caches of the public URL are invalidated
