@@ -33,6 +33,13 @@ SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "showcase-images")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # required for /api/publish
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # required for authenticated endpoints
 
+# TECH: local-app trust bypass. Only ever set in backend-dev/.env, never in
+# the deployed (Render) config. FIX650: the local app drops the login
+# requirement entirely, so an unauthenticated request against this backend
+# is treated as the trusted local admin instead of anonymous.
+LOCAL_APP = os.environ.get("LOCAL_APP") == "1"
+LOCAL_APP_USER_ID = "cff25e93-75f6-4dc7-950a-7a53ddd7d813"  # Herve, app_user.profile='admin'
+
 # Cloudflare R2 (S3-compatible) — image object storage. The database and auth
 # stay in Supabase; only image FILES live in R2. Public reads come from
 # R2_PUBLIC_BASE (the bucket's r2.dev URL or a custom domain).
@@ -253,9 +260,14 @@ def _verify_token(token: str) -> dict:
 
 
 def current_user_optional(request: Request) -> Optional[dict]:
-    """Returns {id, email} if a valid bearer token is present, None otherwise."""
+    """Returns {id, email} if a valid bearer token is present, None otherwise.
+    FIX650 / TECH (LOCAL_APP): with no bearer token, a local-app deployment
+    resolves to the trusted local admin instead of anonymous — the local
+    app has no sign-in flow."""
     auth = request.headers.get("authorization") or ""
     if not auth.lower().startswith("bearer "):
+        if LOCAL_APP:
+            return {"id": LOCAL_APP_USER_ID, "email": "herve@showcase.app"}
         return None
     user = _verify_token(auth.split(" ", 1)[1].strip())
     return {"id": user.get("id"), "email": user.get("email")}
@@ -2788,9 +2800,14 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 left join folder_image fi on fi.folder_id = f.id and fi.is_main
                 left join image img       on img.id = fi.image_id
                 where f.project_id = %s and not f.is_master
+                  -- FIX620.4.2.2: draft items (camera-capture, not yet
+                  -- published) are only visible to the local app —
+                  -- LOCAL_APP is never set on the deployed backend, so the
+                  -- public site never sees them regardless of caller.
+                  and (not f.is_draft or %s)
                 order by f.sort_order, f.id
                 """,
-                (project["id"],),
+                (project["id"], LOCAL_APP),
             )
             rows = cur.fetchall()
     folders = [
@@ -3701,6 +3718,62 @@ async def set_edit_lock_pending_changes(project_id: int, request: Request):
     return {"ok": True}
 
 
+def _get_or_create_folder(cur, project_id, item_name, is_draft=False):
+    """FIX371.6.1 / FIX620.4.2.2: find the item's folder by name, or
+    auto-create it (under the project's Master Folder, blank properties)
+    when the name isn't known yet. Shared by /api/images/confirm (upload
+    already in hand) and /api/folders (bare creation, for staging).
+    `is_draft` only applies to the INSERT branch — a found-existing row's
+    draft state is left untouched here (confirm_image clears it instead)."""
+    cur.execute(
+        "select id from folder where project_id = %s and name = %s",
+        (project_id, item_name),
+    )
+    row = cur.fetchone()
+    if row:
+        return row["id"]
+    cur.execute(
+        "select id from folder where project_id = %s and is_master order by id limit 1",
+        (project_id,),
+    )
+    master = cur.fetchone()
+    if not master:
+        raise HTTPException(status_code=500, detail="project has no Master Folder")
+    cur.execute(
+        "select coalesce(max(sort_order), -1) as m from folder "
+        "where project_id = %s and parent_id = %s",
+        (project_id, master["id"]),
+    )
+    next_fsort = (cur.fetchone()["m"] or -1) + 1
+    cur.execute(
+        "insert into folder (project_id, parent_id, name, sort_order, is_draft) "
+        "values (%s, %s, %s, %s, %s) returning id",
+        (project_id, master["id"], item_name, next_fsort, is_draft),
+    )
+    return cur.fetchone()["id"]
+
+
+@app.post("/api/folders")
+async def create_folder(request: Request):
+    """FIX620.4.2.2: bare item creation (no image) — lets the client stage
+    a captured photo locally (status 'Added') against a real item before
+    any upload happens, same posture as /api/images/sign-upload (no auth
+    dependency; local app has no login). `draft: true` (camera-capture)
+    keeps the item out of /api/showcase for non-local callers until its
+    first image is actually confirmed."""
+    payload = await request.json()
+    project_id = payload.get("project_id")
+    name = (payload.get("name") or "").strip()
+    is_draft = bool(payload.get("draft"))
+    if not project_id or not name:
+        raise HTTPException(status_code=400, detail="project_id, name required")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            folder_id = _get_or_create_folder(cur, project_id, name, is_draft=is_draft)
+        conn.commit()
+    return {"id": folder_id, "name": name}
+
+
 @app.post("/api/images/confirm")
 async def confirm_image(request: Request):
     payload = await request.json()
@@ -3724,34 +3797,14 @@ async def confirm_image(request: Request):
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            folder_id = _get_or_create_folder(cur, project_id, item_name)
+            # FIX620.4.2.2: the first confirmed image publishes a draft item
+            # too — "the new items are part the publication". No-op for
+            # already-public folders.
             cur.execute(
-                "select id from folder where project_id = %s and name = %s",
-                (project_id, item_name),
+                "update folder set is_draft = false where id = %s and is_draft",
+                (folder_id,),
             )
-            row = cur.fetchone()
-            if row:
-                folder_id = row["id"]
-            else:
-                # FIX371.6.1: auto-create the item if the id isn't known.
-                cur.execute(
-                    "select id from folder where project_id = %s and is_master order by id limit 1",
-                    (project_id,),
-                )
-                master = cur.fetchone()
-                if not master:
-                    raise HTTPException(status_code=500, detail="project has no Master Folder")
-                cur.execute(
-                    "select coalesce(max(sort_order), -1) as m from folder "
-                    "where project_id = %s and parent_id = %s",
-                    (project_id, master["id"]),
-                )
-                next_fsort = (cur.fetchone()["m"] or -1) + 1
-                cur.execute(
-                    "insert into folder (project_id, parent_id, name, sort_order) "
-                    "values (%s, %s, %s, %s) returning id",
-                    (project_id, master["id"], item_name, next_fsort),
-                )
-                folder_id = cur.fetchone()["id"]
 
             # Record the stored byte size (read from R2) so the size stats
             # don't depend on the storage backend's own metadata tables.
