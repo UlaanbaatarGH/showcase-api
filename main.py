@@ -2812,14 +2812,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 left join folder_image fi on fi.folder_id = f.id and fi.is_main
                 left join image img       on img.id = fi.image_id
                 where f.project_id = %s and not f.is_master
-                  -- FIX620.4.2.2: draft items (camera-capture, not yet
-                  -- published) are only visible to the local app —
-                  -- LOCAL_APP is never set on the deployed backend, so the
-                  -- public site never sees them regardless of caller.
-                  and (not f.is_draft or %s)
                 order by f.sort_order, f.id
                 """,
-                (project["id"], LOCAL_APP),
+                (project["id"],),
             )
             rows = cur.fetchall()
     folders = [
@@ -3794,13 +3789,11 @@ async def set_edit_lock_pending_changes(project_id: int, request: Request):
     return {"ok": True}
 
 
-def _get_or_create_folder(cur, project_id, item_name, is_draft=False):
+def _get_or_create_folder(cur, project_id, item_name):
     """FIX371.6.1 / FIX620.4.2.2: find the item's folder by name, or
     auto-create it (under the project's Master Folder, blank properties)
     when the name isn't known yet. Shared by /api/images/confirm (upload
-    already in hand) and /api/folders (bare creation, for staging).
-    `is_draft` only applies to the INSERT branch — a found-existing row's
-    draft state is left untouched here (confirm_image clears it instead)."""
+    already in hand) and /api/folders (bare creation, for staging)."""
     cur.execute(
         "select id from folder where project_id = %s and name = %s",
         (project_id, item_name),
@@ -3822,9 +3815,9 @@ def _get_or_create_folder(cur, project_id, item_name, is_draft=False):
     )
     next_fsort = (cur.fetchone()["m"] or -1) + 1
     cur.execute(
-        "insert into folder (project_id, parent_id, name, sort_order, is_draft) "
-        "values (%s, %s, %s, %s, %s) returning id",
-        (project_id, master["id"], item_name, next_fsort, is_draft),
+        "insert into folder (project_id, parent_id, name, sort_order) "
+        "values (%s, %s, %s, %s) returning id",
+        (project_id, master["id"], item_name, next_fsort),
     )
     return cur.fetchone()["id"]
 
@@ -3834,18 +3827,15 @@ async def create_folder(request: Request):
     """FIX620.4.2.2: bare item creation (no image) — lets the client stage
     a captured photo locally (status 'Added') against a real item before
     any upload happens, same posture as /api/images/sign-upload (no auth
-    dependency; local app has no login). `draft: true` (camera-capture)
-    keeps the item out of /api/showcase for non-local callers until its
-    first image is actually confirmed."""
+    dependency; local app has no login)."""
     payload = await request.json()
     project_id = payload.get("project_id")
     name = (payload.get("name") or "").strip()
-    is_draft = bool(payload.get("draft"))
     if not project_id or not name:
         raise HTTPException(status_code=400, detail="project_id, name required")
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            folder_id = _get_or_create_folder(cur, project_id, name, is_draft=is_draft)
+            folder_id = _get_or_create_folder(cur, project_id, name)
         conn.commit()
     return {"id": folder_id, "name": name}
 
@@ -3874,13 +3864,6 @@ async def confirm_image(request: Request):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             folder_id = _get_or_create_folder(cur, project_id, item_name)
-            # FIX620.4.2.2: the first confirmed image publishes a draft item
-            # too — "the new items are part the publication". No-op for
-            # already-public folders.
-            cur.execute(
-                "update folder set is_draft = false where id = %s and is_draft",
-                (folder_id,),
-            )
 
             # Record the stored byte size (read from R2) so the size stats
             # don't depend on the storage backend's own metadata tables.
