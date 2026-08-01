@@ -3219,12 +3219,35 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_
                 "select id, label from property where master_folder_id = %s",
                 (master_folder_id,),
             )
-            label_to_prop = {r["label"]: r["id"] for r in cur.fetchall()}
+            property_rows = cur.fetchall()
+            label_to_prop = {r["label"]: r["id"] for r in property_rows}
+            # Traced: two properties sharing the same label would make the
+            # dict comprehension above silently keep only one of their ids —
+            # every update sent under that label then routes to whichever id
+            # happened to win, which could be the *wrong* property while
+            # looking completely successful (no skip, no logged conflict).
+            _by_label = {}
+            for r in property_rows:
+                _by_label.setdefault(r["label"], []).append(r["id"])
+            for label, ids in _by_label.items():
+                if len(ids) > 1:
+                    print(f"import-gsheet: property label={label!r} is shared by ids {ids} — "
+                          f"updates sent under this label will all route to id {label_to_prop[label]}, "
+                          f"the others are unreachable", flush=True)
             cur.execute(
                 "select id, name from folder where project_id = %s",
                 (project_id,),
             )
-            name_to_folder = {r["name"]: r["id"] for r in cur.fetchall()}
+            folder_rows = cur.fetchall()
+            name_to_folder = {r["name"]: r["id"] for r in folder_rows}
+            _by_name = {}
+            for r in folder_rows:
+                _by_name.setdefault(r["name"], []).append(r["id"])
+            for name, ids in _by_name.items():
+                if len(ids) > 1:
+                    print(f"import-gsheet: folder name={name!r} is shared by ids {ids} — "
+                          f"updates sent for this name will all route to id {name_to_folder[name]}, "
+                          f"the others are unreachable", flush=True)
 
             # 5) aggregate and merge updates into folder.properties JSONB
             # Traced (temporary, for tracking down FIX370 import bugs): logs
