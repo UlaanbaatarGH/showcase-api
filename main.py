@@ -3840,6 +3840,83 @@ async def create_folder(request: Request):
     return {"id": folder_id, "name": name}
 
 
+# FIX652.2.2 <cmd-publish-changes>: applies a pending Ref swap (FIX657) to a
+# real item once <cmd-publish-changes> processes its
+# <file-flag-chged-item-ref>-tagged staging folder. Rejects a collision with
+# another item's Ref in the same project -- same check confirmNewItemRef
+# already runs client-side, kept here too since this is the point the DB
+# actually changes.
+@app.patch("/api/folders/{folder_id}")
+async def rename_folder(
+    folder_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    payload = await request.json()
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select project_id from folder where id = %s", (folder_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="folder not found")
+            cur.execute(
+                "select 1 from folder where project_id = %s and id != %s and name = %s",
+                (row["project_id"], folder_id, name),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail=f"Ref {name} is already in use")
+            cur.execute("update folder set name = %s where id = %s", (name, folder_id))
+        conn.commit()
+    return {"id": folder_id, "name": name}
+
+
+# FIX652.2.1 <cmd-publish-changes>: deletes an item's folder together with
+# every image exclusively attached to it (bucket objects included) --
+# processes a <file-flag-removed-item>-tagged staging folder (FIX658).
+@app.delete("/api/folders/{folder_id}")
+async def delete_folder(
+    folder_id: int,
+    user=Depends(current_user_required),
+):
+    storage_keys_to_drop = []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id from folder where id = %s", (folder_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="folder not found")
+            cur.execute(
+                "select image_id from folder_image where folder_id = %s",
+                (folder_id,),
+            )
+            image_ids = [r["image_id"] for r in cur.fetchall()]
+            cur.execute("delete from folder_image where folder_id = %s", (folder_id,))
+            for image_id in image_ids:
+                cur.execute(
+                    "select 1 from folder_image where image_id = %s limit 1",
+                    (image_id,),
+                )
+                if cur.fetchone() is not None:
+                    continue  # still used by another folder
+                cur.execute("select storage_key from image where id = %s", (image_id,))
+                img = cur.fetchone()
+                if img:
+                    storage_keys_to_drop.append(img["storage_key"])
+                    cur.execute("delete from image where id = %s", (image_id,))
+            cur.execute("delete from folder where id = %s", (folder_id,))
+        conn.commit()
+    # Same posture as delete_folder_image: drop bucket objects after the DB
+    # commit so a transient bucket error never leaves a half-removed row.
+    for key in storage_keys_to_drop:
+        try:
+            _bucket_delete(key)
+        except HTTPException as e:
+            print(f"delete_folder: bucket cleanup failed for {key}: {e.detail}", flush=True)
+    return {"deleted": True, "images_deleted": len(storage_keys_to_drop)}
+
+
 @app.post("/api/images/confirm")
 async def confirm_image(request: Request):
     payload = await request.json()
