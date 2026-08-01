@@ -3069,7 +3069,8 @@ def _save_setup_impl(payload):
 
 
 # ============================================================
-# FIX370: Google Sheet import — one transactional endpoint
+# FIX370 / FIX370.0 <cmd-import-google-sheet>: Google Sheet import — one
+# transactional endpoint
 # ============================================================
 @app.post("/api/projects/{project_id}/import-gsheet")
 async def import_gsheet(
