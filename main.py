@@ -3227,13 +3227,38 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_
             name_to_folder = {r["name"]: r["id"] for r in cur.fetchall()}
 
             # 5) aggregate and merge updates into folder.properties JSONB
+            # Traced (temporary, for tracking down FIX370 import bugs): logs
+            # every update the server can't resolve to a real folder/property,
+            # plus any (folder, property) pair that receives more than one
+            # value in this same batch — the second overwrites the first
+            # silently otherwise, with nothing surfaced to the caller.
             per_folder = {}
+            skipped_folder = 0
+            skipped_prop = 0
             for u in updates:
-                fid = name_to_folder.get(u.get("folder_name"))
-                pid = label_to_prop.get(u.get("property_label"))
-                if fid is None or pid is None:
+                folder_name = u.get("folder_name")
+                property_label = u.get("property_label")
+                fid = name_to_folder.get(folder_name)
+                pid = label_to_prop.get(property_label)
+                if fid is None:
+                    skipped_folder += 1
+                    print(f"import-gsheet: skip update, unknown folder_name={folder_name!r} "
+                          f"(property_label={property_label!r})", flush=True)
                     continue
-                per_folder.setdefault(fid, {})[str(pid)] = u.get("value", "") or ""
+                if pid is None:
+                    skipped_prop += 1
+                    print(f"import-gsheet: skip update, unknown property_label={property_label!r} "
+                          f"(folder_name={folder_name!r})", flush=True)
+                    continue
+                folder_map = per_folder.setdefault(fid, {})
+                if str(pid) in folder_map and folder_map[str(pid)] != (u.get("value", "") or ""):
+                    print(f"import-gsheet: folder_name={folder_name!r} property_label={property_label!r} "
+                          f"got two different values in this batch: {folder_map[str(pid)]!r} -> "
+                          f"{u.get('value', '') or ''!r} (last one wins)", flush=True)
+                folder_map[str(pid)] = u.get("value", "") or ""
+            print(f"import-gsheet: {len(updates)} update entries received, "
+                  f"{len(per_folder)} folders touched, {skipped_folder} skipped "
+                  f"(unknown folder), {skipped_prop} skipped (unknown property)", flush=True)
 
             for fid, merge_map in per_folder.items():
                 cur.execute(
