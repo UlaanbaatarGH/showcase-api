@@ -3084,6 +3084,7 @@ async def import_gsheet(
       "new_properties": ["Writer", "Genre"],
       "renames": [{"id": 5, "label": "Writer"}],
       "new_folders": ["F001", "F002"],
+      "folder_renames": [{"id": 42, "name": "F003"}],
       "updates": [
         {"folder_name": "F001", "property_label": "Writer", "value": "Hugo"}
       ]
@@ -3095,10 +3096,13 @@ async def import_gsheet(
     new_properties = payload.get("new_properties") or []
     renames = payload.get("renames") or []
     new_folders = payload.get("new_folders") or []
+    folder_renames = payload.get("folder_renames") or []
     updates = payload.get("updates") or []
 
     try:
-        return _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates)
+        return _apply_gsheet_plan(
+            project_id, new_properties, renames, new_folders, folder_renames, updates
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -3109,7 +3113,7 @@ async def import_gsheet(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
-def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates):
+def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_renames, updates):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select id from project where id = %s", (project_id,))
@@ -3182,6 +3186,16 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates
                     (r["label"], r["id"], master_folder_id),
                 )
 
+            # 2b) folder renames (FIX370.2.1.7) — rename an existing item's
+            # '#' (folder.name) before the name_to_folder lookup (step 4) is
+            # built, so later updates resolve against the new name.
+            for r in folder_renames:
+                cur.execute(
+                    "update folder set name = %s "
+                    "where id = %s and project_id = %s",
+                    (r["name"], r["id"], project_id),
+                )
+
             # 3) new folders (as children of the master folder)
             cur.execute(
                 "select coalesce(max(sort_order), -1) as m from folder "
@@ -3233,6 +3247,7 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, updates
         "new_properties_count": len(new_prop_ids),
         "renames_count": len(renames),
         "new_folders_count": len(new_folder_ids),
+        "folder_renames_count": len(folder_renames),
         "updated_folders_count": len(per_folder),
     }
 
