@@ -3542,7 +3542,16 @@ async def sign_upload(request: Request):
     # FIX371: refuse to hand out an upload URL for a key already backing a live
     # image — real updates go through replaces_image_id, not a silent overwrite.
     # An orphan object (no image row) is fine: the presigned PUT just overwrites it.
-    if _has_image_row(storage_key):
+    # Unlike the S3 call below, this had no error handling at all -- a dead/stale
+    # pool connection (e.g. Supabase's pgBouncer dropping an idle one) raised
+    # straight through as a bare Starlette 500 with no detail, instead of a
+    # clear 502 like every other DB-adjacent failure here.
+    try:
+        already_backed = _has_image_row(storage_key)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Could not check storage_key: {e}")
+    if already_backed:
         raise HTTPException(status_code=409, detail="storage_key already backs an image")
     # S3 presigned PUT. ContentType is intentionally NOT signed, so the client's
     # own Content-Type header is accepted (and stored) without a signature mismatch.
@@ -3594,59 +3603,80 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
     served with an immutable 1-year cache, so reusing the old key would keep
     serving the old bytes — repoints the image row, then deletes the old object
     so the shrink actually frees storage. Returns the new url + byte size."""
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=503, detail="bucket uploads not configured")
-    payload = await request.json()
-    content_type = payload.get("content_type") or "image/jpeg"
-    # FIX521.5.8.1 <img-zoom-factor>: shrinking changes the pixel dims, so the
-    # client recomputes the image's ZF and sends it to be re-stored. Optional.
-    zoom_factor = payload.get("zoom_factor")
-    if zoom_factor is not None:
-        try:
-            zoom_factor = float(zoom_factor)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="zoom_factor must be a number or null")
+    # Bug fix: an unhandled exception anywhere in this body (e.g. a bad/
+    # truncated request body failing request.json(), a pool/DB error) fell
+    # through to Starlette's default handler, which returned a bare 500 with
+    # NO body -- reported live as an empty-body 500 (and, once, a client-side
+    # ERR_CONTENT_LENGTH_MISMATCH) on a rotated-image publish, with nothing
+    # useful in the app logs to diagnose it by. Same try/except-and-log
+    # pattern already used by save_setup/import-gsheet/sign-upload above.
+    # Bug fix: this early-exit checked SUPABASE_SERVICE_ROLE_KEY (needed by an
+    # unrelated Supabase REST call elsewhere in this file) instead of the R2
+    # credentials this endpoint's own upload_to_bucket()/s3() actually need —
+    # a copy-paste of the wrong guard. s3() already raises the correct "R2
+    # storage not configured" 503 off the right variables (R2_ENDPOINT/
+    # R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY) the moment it's called; this
+    # just fast-fails on the same condition before doing the DB round-trip.
     try:
-        raw = base64.b64decode(payload.get("data_base64") or "", validate=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"could not decode image data: {e}")
-    if not raw:
-        raise HTTPException(status_code=400, detail="empty image data")
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select storage_key from image where id = %s", (image_id,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="image not found")
-            old_key = row["storage_key"]
-            # Versioned key so the immutable CDN cache of the old public URL is
-            # bypassed. Small incrementing counter (_v1, _v2, ...); never stack —
-            # strip any existing _v<n> before appending the next.
-            last = old_key.rsplit("/", 1)[-1]
-            if "." in last:
-                base, _, ext = old_key.rpartition(".")
-                dot_ext = "." + ext
-            else:
-                base, dot_ext = old_key, ""
-            m = re.search(r"_v(\d+)$", base)
-            n = int(m.group(1)) + 1 if m else 1
-            if m:
-                base = base[: m.start()]
-            new_key = f"{base}_v{n}{dot_ext}"
-            upload_to_bucket(new_key, raw, content_type)
-            cur.execute(
-                "update image set storage_key = %s, zoom_factor = %s, bytes = %s where id = %s",
-                (new_key, zoom_factor, len(raw), image_id),
-            )
-        conn.commit()
-    # Best-effort delete of the old object (after commit, so a delete failure
-    # can't undo the repoint). This is what makes the shrink free storage.
-    if old_key and old_key != new_key:
+        if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
+            raise HTTPException(status_code=503, detail="R2 storage not configured")
+        payload = await request.json()
+        content_type = payload.get("content_type") or "image/jpeg"
+        # FIX521.5.8.1 <img-zoom-factor>: shrinking changes the pixel dims, so the
+        # client recomputes the image's ZF and sends it to be re-stored. Optional.
+        zoom_factor = payload.get("zoom_factor")
+        if zoom_factor is not None:
+            try:
+                zoom_factor = float(zoom_factor)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="zoom_factor must be a number or null")
         try:
-            _bucket_delete(old_key)
-        except Exception:
-            pass
-    return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
+            raw = base64.b64decode(payload.get("data_base64") or "", validate=False)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not decode image data: {e}")
+        if not raw:
+            raise HTTPException(status_code=400, detail="empty image data")
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("select storage_key from image where id = %s", (image_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="image not found")
+                old_key = row["storage_key"]
+                # Versioned key so the immutable CDN cache of the old public URL is
+                # bypassed. Small incrementing counter (_v1, _v2, ...); never stack —
+                # strip any existing _v<n> before appending the next.
+                last = old_key.rsplit("/", 1)[-1]
+                if "." in last:
+                    base, _, ext = old_key.rpartition(".")
+                    dot_ext = "." + ext
+                else:
+                    base, dot_ext = old_key, ""
+                m = re.search(r"_v(\d+)$", base)
+                n = int(m.group(1)) + 1 if m else 1
+                if m:
+                    base = base[: m.start()]
+                new_key = f"{base}_v{n}{dot_ext}"
+                upload_to_bucket(new_key, raw, content_type)
+                cur.execute(
+                    "update image set storage_key = %s, zoom_factor = %s, bytes = %s where id = %s",
+                    (new_key, zoom_factor, len(raw), image_id),
+                )
+            conn.commit()
+        # Best-effort delete of the old object (after commit, so a delete failure
+        # can't undo the repoint). This is what makes the shrink free storage.
+        if old_key and old_key != new_key:
+            try:
+                _bucket_delete(old_key)
+            except Exception:
+                pass
+        return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"replace_image_bytes failed (image_id={image_id}, bytes={len(raw) if 'raw' in locals() else '?'}):\n{tb}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 # ============================================================
@@ -4153,7 +4183,7 @@ async def delete_folder_image(
     return {"deleted": True, "image_deleted": storage_key_to_drop is not None}
 
 
-# FIX501.4.4.10 non-destructive save: update crop rectangle and/or rotation
+# FIX524.4.10 non-destructive save: update crop rectangle and/or rotation
 # on the Image row. The physical asset in
 # the bucket is never touched — the viewer composes the final pixels at
 # render time from storage_key + rotation + crop.
