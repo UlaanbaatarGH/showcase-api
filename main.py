@@ -3103,6 +3103,56 @@ def _save_setup_impl(payload):
                         (list(raters_to_delete),),
                     )
 
+                # FIX373.5.1 / .1.1-.1.4 (Topic 6, User's basket): keep the
+                # auto-generated 'My basket: ...' groups in sync with
+                # table-rating-values and field-enable-rating -- one
+                # readonly group per rating value plus one for missing
+                # ratings, all removed when rating is disabled. Ids are
+                # deterministic (g-rating-{value_id} / g-rating-missing)
+                # so re-saving is idempotent instead of piling up
+                # duplicates. FIX373.5.1.4: the property_id namespace
+                # ('rating:{id}') only ever encodes a rating VALUE, never
+                # a specific other user, so there is no other-user option
+                # to accidentally expose here.
+                cur.execute(
+                    "select id, icon from rating_value where project_id = %s "
+                    "order by sort_order, id",
+                    (project_id,),
+                )
+                current_values = cur.fetchall()
+                basket_showcase_cfg = view_setup.get("showcase") or {}
+                existing_groups = list(basket_showcase_cfg.get("groups") or [])
+                other_groups = [
+                    g for g in existing_groups
+                    if not str(g.get("property_id", "")).startswith("rating:")
+                ]
+                basket_groups = []
+                if rating_payload.get("enabled"):
+                    # FIX373.5.1.2: Name: 'My basket: ' + <rating-icon> --
+                    # rendered as its FIX507.4.5 symbol since a group name
+                    # is plain text.
+                    icon_symbol = {"yes": "✓", "unknown": "?", "no": "✗"}
+                    for v in current_values:
+                        basket_groups.append({
+                            "id": f"g-rating-{v['id']}",
+                            "name": f"My basket: {icon_symbol.get(v['icon'], '?')}",
+                            "property_id": f"rating:{v['id']}",
+                            "segment": None,
+                            "default": False,
+                            "readonly": True,
+                        })
+                    # FIX373.5.1.3.
+                    basket_groups.append({
+                        "id": "g-rating-missing",
+                        "name": "My basket: Missing rating",
+                        "property_id": "rating:missing",
+                        "segment": None,
+                        "default": False,
+                        "readonly": True,
+                    })
+                basket_showcase_cfg["groups"] = other_groups + basket_groups
+                view_setup["showcase"] = basket_showcase_cfg
+
             # FIX350.2.3.1: properties belong to a Master Folder. /api/setup
             # currently edits a single project's list; we target the one Master
             # Folder. If multiple Master Folders exist (FIX350.2.3.3), the
