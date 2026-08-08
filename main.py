@@ -1769,6 +1769,10 @@ async def update_admin_project(
                         "values (%s, %s, %s, %s, 'CRUD', 'CRUD')",
                         (uid, project_id, uid in data_set, uid in user_set),
                     )
+                # FIX507.4.3: the roster rebuild above may have dropped or
+                # demoted any number of users at once -- re-check every
+                # rater of this project rather than a single user_id.
+                _disable_raters_without_rights(cur, project_id)
             # FIX352.2.5 / .2.6: persist the introductions.
             if front_introduction is not None:
                 cur.execute(
@@ -2290,6 +2294,7 @@ def clear_project_managers(project_id: int, _admin=Depends(current_admin_require
                 "delete from project_access where project_id = %s",
                 (project_id,),
             )
+            _disable_raters_without_rights(cur, project_id)
         conn.commit()
     return {"ok": True}
 
@@ -2382,6 +2387,38 @@ def _require_admin_or_user_manager_of(cur, caller_id: str, project_id: int) -> N
         )
 
 
+def _disable_raters_without_rights(cur, project_id, user_id=None):
+    """FIX507.4.3: a <table-users-allowed-to-rate> row is auto-disabled
+    (never deleted, never re-enabled here) once its user no longer has
+    admin or data-manager rights on the project -- losing project
+    access entirely, or being demoted off the data-manager list. Global
+    admins are exempt since FIX507.2.3.1.12.1 always allows them.
+    `user_id` narrows the check to one user (e.g. after a single
+    revoke); omit it to re-check every rater of the project (e.g.
+    after a bulk manager-roster rebuild)."""
+    params = [project_id]
+    user_filter = ""
+    if user_id is not None:
+        user_filter = "and pr.user_id = %s"
+        params.append(user_id)
+    cur.execute(
+        f"""
+        update project_rater pr set enabled = false
+        where pr.project_id = %s {user_filter}
+          and pr.enabled
+          and not exists (
+            select 1 from app_user u where u.id = pr.user_id and u.profile = 'admin'
+          )
+          and not exists (
+            select 1 from project_access pa
+            where pa.project_id = pr.project_id and pa.user_id = pr.user_id
+              and pa.is_data_manager
+          )
+        """,
+        params,
+    )
+
+
 @app.post("/api/admin/users/{user_id}/projects/{project_id}")
 def grant_user_project(
     user_id: str,
@@ -2434,6 +2471,7 @@ def revoke_user_project(
                 "where user_id = %s and project_id = %s",
                 (user_id, project_id),
             )
+            _disable_raters_without_rights(cur, project_id, user_id)
         conn.commit()
     return {"ok": True}
 
@@ -2709,7 +2747,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 # project resolves it, so URLs from before a rename
                 # keep working as long as their slug stays active.
                 cur.execute(
-                    "select p.id, p.name, p.is_public, p.view_setup, "
+                    "select p.id, p.name, p.is_public, p.view_setup, p.enable_rating, "
                     "       p.front_introduction, p.introduction, "
                     "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
@@ -2726,7 +2764,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     # project name. Drop this once the migration has
                     # run on every environment.
                     cur.execute(
-                        "select id, name, view_setup, "
+                        "select id, name, view_setup, enable_rating, "
                         "       front_introduction, introduction, "
                         "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                         "from project order by sort_order, id"
@@ -2740,7 +2778,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     raise HTTPException(status_code=404, detail="project not found")
             else:
                 cur.execute(
-                    "select id, name, is_public, view_setup, "
+                    "select id, name, is_public, view_setup, enable_rating, "
                     "       front_introduction, introduction, "
                     "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project "
@@ -2756,6 +2794,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     "properties": [],
                     "view_setup": {},
                     "folders": [],
+                    "rating_setup": {"enabled": False, "values": [], "raters": []},
+                    "rating_candidates": [],
                 }
             # FIX503.5.1: caller is admin (global role) or manager
             # (project_access row for this project).
@@ -2800,7 +2840,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
                   exists (select 1 from folder_image where folder_id = f.id) as has_image,
-                  -- FIX500.2.3.2.1.2.2.4 <Image size>: total bytes of this item's
+                  -- FIX504.2.1.2.2.4 <Image size>: total bytes of this item's
                   -- images, summed from the image table's stored byte size.
                   coalesce((
                     select sum(i2.bytes)
@@ -2817,6 +2857,38 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 (project["id"],),
             )
             rows = cur.fetchall()
+            # FIX507.2.2.1 <table-rating-values>: text + icon rows.
+            cur.execute(
+                "select id, text, icon from rating_value "
+                "where project_id = %s order by sort_order, id",
+                (project["id"],),
+            )
+            rating_values = cur.fetchall()
+            # FIX507.2.3.1 <table-users-allowed-to-rate>: joined to
+            # app_user for the display name.
+            cur.execute(
+                "select pr.id, pr.user_id, u.login_name as name, "
+                "       pr.acronym, pr.enabled "
+                "from project_rater pr "
+                "join app_user u on u.id = pr.user_id "
+                "where pr.project_id = %s order by u.login_name",
+                (project["id"],),
+            )
+            raters = cur.fetchall()
+            # FIX507.2.3.1.12.1: <rating-user> is picked from users having
+            # admin or data-manager rights on this project -- global admins
+            # union this project's data managers (same is_data_manager flag
+            # FIX351.2.1.2 / list_projects already reads).
+            cur.execute(
+                "select id, login_name as name from app_user where profile = 'admin' "
+                "union "
+                "select u.id, u.login_name as name from app_user u "
+                "join project_access pa on pa.user_id = u.id "
+                "where pa.project_id = %s and pa.is_data_manager "
+                "order by name",
+                (project["id"],),
+            )
+            rating_candidates = cur.fetchall()
     folders = [
         {
             "id": r["id"],
@@ -2829,7 +2901,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             ),
             "main_rotation": r["main_rotation"],
             "has_image": bool(r["has_image"]),
-            # FIX500.2.3.2.1.2.2.4 <Image size>: sum of this item's image bytes.
+            # FIX504.2.1.2.2.4 <Image size>: sum of this item's image bytes.
             "image_bytes": int(r["image_bytes"] or 0),
             # FIX521.5.8.0 <item-img-zoom-factor>: stored item Zoom Factor.
             "zoom_factor": r["zoom_factor"],
@@ -2859,6 +2931,14 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
         "properties": properties,
         "view_setup": project["view_setup"] or {},
         "folders": folders,
+        # FIX507.2.1 / FIX507.2.2 / FIX507.2.3 <panel-rating-setup>.
+        "rating_setup": {
+            "enabled": bool(project.get("enable_rating")),
+            "values": rating_values,
+            "raters": raters,
+        },
+        # FIX507.2.3.1.12.1 <rating-user> picker source.
+        "rating_candidates": rating_candidates,
     }
 
 
@@ -2900,6 +2980,92 @@ def _save_setup_impl(payload):
             if not project:
                 raise HTTPException(status_code=404, detail="no project")
             project_id = project["id"]
+
+            # FIX507.4.2: <panel-rating-setup> is saved as part of this
+            # same general setup save function, not a separate endpoint.
+            # Callers that don't touch the Rating tab omit "rating"
+            # entirely, leaving the existing DB state untouched.
+            rating_payload = payload.get("rating")
+            if rating_payload is not None:
+                cur.execute(
+                    "update project set enable_rating = %s where id = %s",
+                    (bool(rating_payload.get("enabled")), project_id),
+                )
+                # FIX507.2.2.1 <table-rating-values>: same insert/update/
+                # delete-by-diff pattern as the property table above.
+                incoming_values = rating_payload.get("values") or []
+                cur.execute(
+                    "select id from rating_value where project_id = %s",
+                    (project_id,),
+                )
+                existing_value_ids = {r["id"] for r in cur.fetchall()}
+                incoming_value_ids = {
+                    v["id"] for v in incoming_values if isinstance(v.get("id"), int)
+                }
+                for idx, v in enumerate(incoming_values):
+                    text = (v.get("text") or "").strip()
+                    if not text:
+                        continue
+                    icon = v.get("icon") or None
+                    sort_order = v.get("sort_order", idx)
+                    if isinstance(v.get("id"), int) and v["id"] in existing_value_ids:
+                        cur.execute(
+                            "update rating_value set text = %s, icon = %s, "
+                            "sort_order = %s where id = %s",
+                            (text, icon, sort_order, v["id"]),
+                        )
+                    else:
+                        cur.execute(
+                            "insert into rating_value "
+                            "(project_id, text, icon, sort_order) "
+                            "values (%s, %s, %s, %s)",
+                            (project_id, text, icon, sort_order),
+                        )
+                values_to_delete = existing_value_ids - incoming_value_ids
+                if values_to_delete:
+                    cur.execute(
+                        "delete from rating_value where id = any(%s)",
+                        (list(values_to_delete),),
+                    )
+
+                # FIX507.2.3.1 <table-users-allowed-to-rate>.
+                incoming_raters = rating_payload.get("raters") or []
+                cur.execute(
+                    "select id from project_rater where project_id = %s",
+                    (project_id,),
+                )
+                existing_rater_ids = {r["id"] for r in cur.fetchall()}
+                incoming_rater_ids = {
+                    r["id"] for r in incoming_raters if isinstance(r.get("id"), int)
+                }
+                for r in incoming_raters:
+                    user_id = r.get("user_id")
+                    if not user_id:
+                        continue
+                    acronym = (r.get("acronym") or "").strip() or None
+                    # FIX507.4.4: Adding a user sets it enabled by default.
+                    enabled = bool(r.get("enabled", True))
+                    if isinstance(r.get("id"), int) and r["id"] in existing_rater_ids:
+                        cur.execute(
+                            "update project_rater set acronym = %s, enabled = %s "
+                            "where id = %s",
+                            (acronym, enabled, r["id"]),
+                        )
+                    else:
+                        cur.execute(
+                            "insert into project_rater "
+                            "(project_id, user_id, acronym, enabled) "
+                            "values (%s, %s, %s, %s) "
+                            "on conflict (project_id, user_id) do update "
+                            "set acronym = excluded.acronym, enabled = excluded.enabled",
+                            (project_id, user_id, acronym, enabled),
+                        )
+                raters_to_delete = existing_rater_ids - incoming_rater_ids
+                if raters_to_delete:
+                    cur.execute(
+                        "delete from project_rater where id = any(%s)",
+                        (list(raters_to_delete),),
+                    )
 
             # FIX350.2.3.1: properties belong to a Master Folder. /api/setup
             # currently edits a single project's list; we target the one Master
@@ -3059,8 +3225,36 @@ def _save_setup_impl(payload):
                 (master_folder_id,),
             )
             fresh_properties = cur.fetchall()
+
+            cur.execute(
+                "select enable_rating from project where id = %s", (project_id,),
+            )
+            enable_rating = bool(cur.fetchone()["enable_rating"])
+            cur.execute(
+                "select id, text, icon from rating_value "
+                "where project_id = %s order by sort_order, id",
+                (project_id,),
+            )
+            fresh_rating_values = cur.fetchall()
+            cur.execute(
+                "select pr.id, pr.user_id, u.login_name as name, "
+                "       pr.acronym, pr.enabled "
+                "from project_rater pr "
+                "join app_user u on u.id = pr.user_id "
+                "where pr.project_id = %s order by u.login_name",
+                (project_id,),
+            )
+            fresh_raters = cur.fetchall()
         conn.commit()
-    return {"properties": fresh_properties, "view_setup": view_setup}
+    return {
+        "properties": fresh_properties,
+        "view_setup": view_setup,
+        "rating_setup": {
+            "enabled": enable_rating,
+            "values": fresh_rating_values,
+            "raters": fresh_raters,
+        },
+    }
 
 
 # ============================================================
