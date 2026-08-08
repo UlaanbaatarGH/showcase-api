@@ -2889,6 +2889,21 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 (project["id"],),
             )
             rating_candidates = cur.fetchall()
+            # FIX520.4.3: the displayed rating is ONLY the logged-in
+            # caller's own -- never fetched/returned for anonymous
+            # callers or for any other user.
+            my_ratings_by_folder = {}
+            if user is not None:
+                cur.execute(
+                    "select ir.folder_id, ir.rating_value_id "
+                    "from item_rating ir "
+                    "join folder f on f.id = ir.folder_id "
+                    "where f.project_id = %s and ir.user_id = %s",
+                    (project["id"], user["id"]),
+                )
+                my_ratings_by_folder = {
+                    r["folder_id"]: r["rating_value_id"] for r in cur.fetchall()
+                }
     folders = [
         {
             "id": r["id"],
@@ -2905,6 +2920,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "image_bytes": int(r["image_bytes"] or 0),
             # FIX521.5.8.0 <item-img-zoom-factor>: stored item Zoom Factor.
             "zoom_factor": r["zoom_factor"],
+            # FIX520.2.7 / FIX520.4.3 <icon-rating>: null when the caller
+            # has no rating entered for this item (FIX520.4.4 hides it).
+            "my_rating_value_id": my_ratings_by_folder.get(r["id"]),
         }
         for r in rows
     ]
@@ -3255,6 +3273,69 @@ def _save_setup_impl(payload):
             "raters": fresh_raters,
         },
     }
+
+
+# ============================================================
+# FIX520.2.7 / FIX520.3.4 / FIX520.4.3-5: item rating -- a logged-in
+# user's own rating of one item. Deliberately separate from
+# _save_setup_impl above (admin-managed rating *configuration*, i.e.
+# FIX507): this write comes from any logged-in visitor viewing the
+# Showcase, not from the admin Setup popup.
+# ============================================================
+@app.post("/api/folders/{folder_id}/rating")
+async def set_item_rating(
+    folder_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    """FIX520.3.4 sets or (rating_value_id: null, the '0' key) clears the
+    caller's own rating for this item. FIX520.4.5: applied immediately,
+    no separate save step. Requires the item's project to have rating
+    enabled and the caller to be an enabled rater on it (FIX507.2.1 /
+    FIX507.2.3.1.3)."""
+    payload = await request.json()
+    rating_value_id = payload.get("rating_value_id")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select f.project_id, p.enable_rating "
+                "from folder f join project p on p.id = f.project_id "
+                "where f.id = %s",
+                (folder_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="item not found")
+            if not row["enable_rating"]:
+                raise HTTPException(status_code=403, detail="rating is not enabled for this project")
+            cur.execute(
+                "select 1 from project_rater "
+                "where project_id = %s and user_id = %s and enabled",
+                (row["project_id"], user["id"]),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=403, detail="not an enabled rater on this project")
+            if rating_value_id is None:
+                cur.execute(
+                    "delete from item_rating where folder_id = %s and user_id = %s",
+                    (folder_id, user["id"]),
+                )
+            else:
+                cur.execute(
+                    "select 1 from rating_value where id = %s and project_id = %s",
+                    (rating_value_id, row["project_id"]),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(status_code=400, detail="unknown rating_value_id")
+                cur.execute(
+                    "insert into item_rating (folder_id, user_id, rating_value_id) "
+                    "values (%s, %s, %s) "
+                    "on conflict (folder_id, user_id) "
+                    "do update set rating_value_id = excluded.rating_value_id",
+                    (folder_id, user["id"], rating_value_id),
+                )
+        conn.commit()
+    return {"folder_id": folder_id, "rating_value_id": rating_value_id}
 
 
 # ============================================================
