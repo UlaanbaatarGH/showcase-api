@@ -2748,6 +2748,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 # keep working as long as their slug stays active.
                 cur.execute(
                     "select p.id, p.name, p.is_public, p.view_setup, p.enable_rating, "
+                    "       p.show_rating_conflict, p.rating_conflict_threshold, "
                     "       p.front_introduction, p.introduction, "
                     "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
@@ -2765,6 +2766,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     # run on every environment.
                     cur.execute(
                         "select id, name, view_setup, enable_rating, "
+                        "       show_rating_conflict, rating_conflict_threshold, "
                         "       front_introduction, introduction, "
                         "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                         "from project order by sort_order, id"
@@ -2779,6 +2781,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             else:
                 cur.execute(
                     "select id, name, is_public, view_setup, enable_rating, "
+                    "       show_rating_conflict, rating_conflict_threshold, "
                     "       front_introduction, introduction, "
                     "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project "
@@ -2794,7 +2797,10 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     "properties": [],
                     "view_setup": {},
                     "folders": [],
-                    "rating_setup": {"enabled": False, "values": [], "raters": []},
+                    "rating_setup": {
+                        "enabled": False, "values": [], "raters": [],
+                        "show_conflict": False, "conflict_threshold": 2,
+                    },
                     "rating_candidates": [],
                 }
             # FIX503.5.1: caller is admin (global role) or manager
@@ -2919,6 +2925,26 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             ratings_by_folder = {}
             for r in cur.fetchall():
                 ratings_by_folder.setdefault(r["folder_id"], {})[str(r["user_id"])] = r["rating_value_id"]
+            # FIX520.4.7 <item-with-conflicting-rating>: only computed
+            # when show_rating_conflict is on -- flags an item where two
+            # or more configured raters (any two, not just the caller)
+            # each rated it at or above the threshold rank
+            # (rating_value.sort_order).
+            conflict_folder_ids = set()
+            if project.get("show_rating_conflict") and ratings_by_folder:
+                cur.execute(
+                    "select id, sort_order from rating_value where project_id = %s",
+                    (project["id"],),
+                )
+                sort_order_by_value_id = {r["id"]: r["sort_order"] for r in cur.fetchall()}
+                threshold = project.get("rating_conflict_threshold") or 2
+                for folder_id, by_user in ratings_by_folder.items():
+                    high_count = sum(
+                        1 for rv_id in by_user.values()
+                        if sort_order_by_value_id.get(rv_id, -1) >= threshold
+                    )
+                    if high_count >= 2:
+                        conflict_folder_ids.add(folder_id)
     folders = [
         {
             "id": r["id"],
@@ -2941,6 +2967,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # FIX504.2.1.2.2.6: every rater's rating of this item, keyed by
             # user_id (string, since JSON object keys can't be a uuid).
             "ratings_by_user": ratings_by_folder.get(r["id"], {}),
+            # FIX520.4.7 / FIX520.4.8 <item-with-conflicting-rating>.
+            "has_rating_conflict": r["id"] in conflict_folder_ids,
         }
         for r in rows
     ]
@@ -2972,6 +3000,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "enabled": bool(project.get("enable_rating")),
             "values": rating_values,
             "raters": raters,
+            # FIX507.2.4 / FIX507.2.5.
+            "show_conflict": bool(project.get("show_rating_conflict")),
+            "conflict_threshold": project.get("rating_conflict_threshold") or 2,
         },
         # FIX507.2.3.1.12.1 <rating-user> picker source.
         "rating_candidates": rating_candidates,
@@ -3026,6 +3057,18 @@ def _save_setup_impl(payload):
                 cur.execute(
                     "update project set enable_rating = %s where id = %s",
                     (bool(rating_payload.get("enabled")), project_id),
+                )
+                # FIX507.2.5.1: mandatory, defaulted to 2 -- an invalid or
+                # missing value falls back to the default rather than
+                # blocking the whole save.
+                try:
+                    conflict_threshold = int(rating_payload.get("conflict_threshold"))
+                except (TypeError, ValueError):
+                    conflict_threshold = 2
+                cur.execute(
+                    "update project set show_rating_conflict = %s, "
+                    "rating_conflict_threshold = %s where id = %s",
+                    (bool(rating_payload.get("show_conflict")), conflict_threshold, project_id),
                 )
                 # FIX507.2.2.1 <table-rating-values>: same insert/update/
                 # delete-by-diff pattern as the property table above.
@@ -3292,9 +3335,11 @@ def _save_setup_impl(payload):
             fresh_properties = cur.fetchall()
 
             cur.execute(
-                "select enable_rating from project where id = %s", (project_id,),
+                "select enable_rating, show_rating_conflict, rating_conflict_threshold "
+                "from project where id = %s", (project_id,),
             )
-            enable_rating = bool(cur.fetchone()["enable_rating"])
+            proj_row = cur.fetchone()
+            enable_rating = bool(proj_row["enable_rating"])
             cur.execute(
                 "select id, text, icon from rating_value "
                 "where project_id = %s order by sort_order, id",
@@ -3318,6 +3363,8 @@ def _save_setup_impl(payload):
             "enabled": enable_rating,
             "values": fresh_rating_values,
             "raters": fresh_raters,
+            "show_conflict": bool(proj_row["show_rating_conflict"]),
+            "conflict_threshold": proj_row["rating_conflict_threshold"] or 2,
         },
     }
 
