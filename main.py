@@ -2904,6 +2904,21 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 my_ratings_by_folder = {
                     r["folder_id"]: r["rating_value_id"] for r in cur.fetchall()
                 }
+            # FIX504.2.1.2.2.6: unlike my_ratings_by_folder above, this is
+            # every configured rater's rating (keyed by user_id), not just
+            # the caller's own -- feeds the per-rater list columns, which
+            # any admin/manager viewing the list can see regardless of who
+            # is logged in.
+            cur.execute(
+                "select ir.folder_id, ir.user_id, ir.rating_value_id "
+                "from item_rating ir "
+                "join folder f on f.id = ir.folder_id "
+                "where f.project_id = %s",
+                (project["id"],),
+            )
+            ratings_by_folder = {}
+            for r in cur.fetchall():
+                ratings_by_folder.setdefault(r["folder_id"], {})[str(r["user_id"])] = r["rating_value_id"]
     folders = [
         {
             "id": r["id"],
@@ -2923,6 +2938,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # FIX520.2.7 / FIX520.4.3 <icon-rating>: null when the caller
             # has no rating entered for this item (FIX520.4.4 hides it).
             "my_rating_value_id": my_ratings_by_folder.get(r["id"]),
+            # FIX504.2.1.2.2.6: every rater's rating of this item, keyed by
+            # user_id (string, since JSON object keys can't be a uuid).
+            "ratings_by_user": ratings_by_folder.get(r["id"], {}),
         }
         for r in rows
     ]
