@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import html
 import time
 import base64
 import hashlib
@@ -703,6 +704,47 @@ def _supabase_admin_delete_user(user_id: str) -> None:
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# FIX378.3.4.2: same sheet-id extraction as the frontend's
+# gsheetImport.js parseGsheetUrl(), duplicated here (no shared module
+# between the two runtimes) since this check has to run server-side --
+# see the endpoint below for why.
+_GSHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
+
+
+@app.post("/api/gsheet-title")
+async def gsheet_title(request: Request, _user=Depends(current_user_required)):
+    """FIX378.3.4.2: fetch a Google Sheet's document title (not to be
+    confused with a tab/sheet name) with no OAuth. The public CSV/gviz
+    export endpoints FIX370's client-side import already fetches set
+    permissive CORS, but the /edit page -- the only place the actual
+    document title shows up (in its <title> tag) -- does not (confirmed:
+    no access-control-allow-origin header), so a browser fetch() would
+    be silently blocked. Server-to-server has no such restriction."""
+    payload = await request.json() if await request.body() else {}
+    url = (payload.get("url") or "").strip()
+    m = _GSHEET_ID_RE.search(url)
+    if not m:
+        return {"title": None}
+    req = urllib.request.Request(
+        f"https://docs.google.com/spreadsheets/d/{m.group(1)}/edit",
+        headers={"User-Agent": "showcase-api/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {"title": None}
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if not title_match:
+        return {"title": None}
+    # Google appends " - Google Sheets" to the raw document title, and
+    # HTML-entity-encodes it (e.g. an '&' in the project name).
+    raw_title = html.unescape(title_match.group(1).strip())
+    title = re.sub(
+        r"\s*-\s*Google Sheets\s*$", "", raw_title, flags=re.IGNORECASE,
+    ).strip()
+    return {"title": title or None}
 
 
 # FIX420.3.1.3 transactional email — Resend is wired when this env
