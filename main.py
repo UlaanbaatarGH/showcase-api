@@ -2970,8 +2970,21 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                      where fi2.folder_id = f.id
                   ), 0) as image_bytes
                 from folder f
-                left join folder_image fi on fi.folder_id = f.id and fi.is_main
-                left join image img       on img.id = fi.image_id
+                -- Bug fix: this used to inner-require fi.is_main, so an item
+                -- with images but none explicitly flagged main (nobody ever
+                -- picked one) got a null main_image_url even though
+                -- has_image was true -- e.g. FIX702's rated-images grid
+                -- silently dropped such items despite them counting toward
+                -- the rating's total. Falls back to the lowest-sort_order
+                -- image when no image is flagged is_main.
+                left join lateral (
+                  select mfi.image_id
+                  from folder_image mfi
+                  where mfi.folder_id = f.id
+                  order by mfi.is_main desc, mfi.sort_order, mfi.id
+                  limit 1
+                ) main_fi on true
+                left join image img on img.id = main_fi.image_id
                 where f.project_id = %s and not f.is_master
                 order by f.sort_order, f.id
                 """,
