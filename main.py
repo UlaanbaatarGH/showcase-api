@@ -674,6 +674,34 @@ def _supabase_admin_create_user(email: str, password: str) -> dict:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
 
 
+# FIX318 <process-reset-pswd>: mirror of _supabase_admin_create_user
+# for removal. Deleting the auth.users row makes has_password (joined
+# off encrypted_password) false again -- the next redeem (FIX317)
+# creates a fresh auth row and rewrites app_user.id, same as initial
+# account creation. A 404 (nothing to delete -- the user never
+# redeemed in the first place) is not an error here.
+def _supabase_admin_delete_user(user_id: str) -> None:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="auth not configured")
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+        method="DELETE",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            msg = e.read().decode("utf-8", errors="replace")
+            raise HTTPException(status_code=400, detail=f"Supabase: {msg[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -2363,6 +2391,30 @@ def delete_user(user_id: str, admin=Depends(current_admin_required)):
         conn.commit()
     if removed == 0:
         raise HTTPException(status_code=404, detail="user not found")
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def reset_user_password(user_id: str, _admin=Depends(current_admin_required)):
+    """FIX318 <process-reset-pswd>: triggered by <btn-reset-pswd>
+    (FIX312.3.1). Same principle as user creation (FIX318.1 /
+    FIX311.3.1.1.3): issue a fresh access code and clear the existing
+    password so the user redeems again via <panel-create-account>
+    (FIX317) at next login."""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from app_user where id = %s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="user not found")
+            # FIX318.2.1: fresh 6-digit code, same generation as FIX311.3.1.1.3.
+            access_code = f"{secrets.randbelow(1000000):06d}"
+            cur.execute(
+                "update app_user set access_code = %s where id = %s",
+                (access_code, user_id),
+            )
+        conn.commit()
+    # FIX318.2.2: clear the existing password / unset <user-has-password>.
+    _supabase_admin_delete_user(user_id)
     return {"ok": True}
 
 
