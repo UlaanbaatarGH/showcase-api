@@ -1,6 +1,6 @@
 -- Showcase V0.5: split project_access "manager" role into two
 -- Covers FIX351.2.1.2 (Column 'Data Managers') + FIX351.2.1.5
--- (Column 'User Managers') + FIX312.5.2 (only User Managers can
+-- (Column 'User Managers') + FIX312.4.2 (only User Managers can
 -- grant project access to users).
 -- Idempotent: safe to re-run.
 

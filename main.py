@@ -333,7 +333,7 @@ def _managed_project_ids(cur, user_id) -> list:
 
 
 def _user_managed_project_ids(cur, user_id) -> list:
-    # FIX312.5.2: User Managers (project_access rows with
+    # FIX312.4.2: User Managers (project_access rows with
     # is_user_manager=true) are the ones allowed to assign or
     # unassign their project to other users.
     cur.execute(
@@ -2367,7 +2367,7 @@ def delete_user(user_id: str, admin=Depends(current_admin_required)):
 
 
 def _require_admin_or_user_manager_of(cur, caller_id: str, project_id: int) -> None:
-    """FIX311.5.6 / FIX312.5.2: editing a user's <user-projects> entry
+    """FIX311.5.6 / FIX312.4.2: editing a user's <user-projects> entry
     for project P is allowed only when the caller is a global admin
     OR a User Manager of P (project_access row with is_user_manager
     true). Plain Data Managers cannot grant access to others."""
