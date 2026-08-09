@@ -2918,8 +2918,15 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     },
                     "rating_candidates": [],
                 }
-            # FIX503.5.1: caller is admin (global role) or manager
-            # (project_access row for this project).
+            # FIX503.4.1: caller is admin (global role) or Manager of the
+            # project (Users listed in <project-managers>, i.e. the Data
+            # Managers column / is_data_manager -- FIX351.2.1.2). Bug fix:
+            # this used to accept *any* project_access row, which also
+            # matched a User-Manager-only row (is_user_manager, a
+            # narrower role -- FIX312.4.2 -- that only grants/revokes
+            # other users' project access, not the admin-gated UI here),
+            # incorrectly showing <menu-admin> and the other FIX503.4.1
+            # affordances to callers who aren't actually Data Managers.
             is_admin_or_manager = False
             if user is not None:
                 cur.execute(
@@ -2932,7 +2939,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 else:
                     cur.execute(
                         "select 1 from project_access "
-                        "where project_id = %s and user_id = %s",
+                        "where project_id = %s and user_id = %s and is_data_manager",
                         (project["id"], user["id"]),
                     )
                     is_admin_or_manager = cur.fetchone() is not None
