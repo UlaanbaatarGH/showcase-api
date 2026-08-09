@@ -739,7 +739,7 @@ async def gsheet_title(request: Request, _user=Depends(current_user_required)):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+            page_html = resp.read().decode("utf-8", errors="replace")
             status = resp.status
     except urllib.error.HTTPError as e:
         # Debugging aid while this is new -- surfaces e.g. a 429/403 from
@@ -751,14 +751,14 @@ async def gsheet_title(request: Request, _user=Depends(current_user_required)):
     except Exception as e:
         print(f"[gsheet-title] {type(e).__name__}: {e} fetching {url!r}", flush=True)
         return {"title": None, "debug": f"{type(e).__name__}: {e}"}
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
     if not title_match:
         print(
-            f"[gsheet-title] no <title> tag, status={status} len={len(html)} "
-            f"head={html[:200]!r}",
+            f"[gsheet-title] no <title> tag, status={status} len={len(page_html)} "
+            f"head={page_html[:200]!r}",
             flush=True,
         )
-        return {"title": None, "debug": f"no title tag in response (HTTP {status}, {len(html)} bytes)"}
+        return {"title": None, "debug": f"no title tag in response (HTTP {status}, {len(page_html)} bytes)"}
     # Google appends " - Google Sheets" to the raw document title, and
     # HTML-entity-encodes it (e.g. an '&' in the project name).
     raw_title = html.unescape(title_match.group(1).strip())
