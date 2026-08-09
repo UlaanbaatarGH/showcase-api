@@ -725,19 +725,40 @@ async def gsheet_title(request: Request, _user=Depends(current_user_required)):
     url = (payload.get("url") or "").strip()
     m = _GSHEET_ID_RE.search(url)
     if not m:
-        return {"title": None}
+        return {"title": None, "debug": "url did not match the spreadsheet id pattern"}
     req = urllib.request.Request(
         f"https://docs.google.com/spreadsheets/d/{m.group(1)}/edit",
-        headers={"User-Agent": "showcase-api/1.0"},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
-    except Exception:
-        return {"title": None}
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        # Debugging aid while this is new -- surfaces e.g. a 429/403 from
+        # Google (suspected: datacenter-IP bot detection on the /edit page,
+        # unlike the CSV/gviz export endpoints FIX370's import already
+        # relies on) instead of silently reporting "nothing readable".
+        print(f"[gsheet-title] HTTPError {e.code} fetching {url!r}", flush=True)
+        return {"title": None, "debug": f"HTTP {e.code} from Google"}
+    except Exception as e:
+        print(f"[gsheet-title] {type(e).__name__}: {e} fetching {url!r}", flush=True)
+        return {"title": None, "debug": f"{type(e).__name__}: {e}"}
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if not title_match:
-        return {"title": None}
+        print(
+            f"[gsheet-title] no <title> tag, status={status} len={len(html)} "
+            f"head={html[:200]!r}",
+            flush=True,
+        )
+        return {"title": None, "debug": f"no title tag in response (HTTP {status}, {len(html)} bytes)"}
     # Google appends " - Google Sheets" to the raw document title, and
     # HTML-entity-encodes it (e.g. an '&' in the project name).
     raw_title = html.unescape(title_match.group(1).strip())
