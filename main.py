@@ -114,10 +114,17 @@ def _create_thumbnail(storage_key: str) -> None:
     thumbnail_storage_key(storage_key). Best-effort -- called from
     confirm_image, where a thumbnail failure must not fail the image
     upload itself (the gallery falls back to the full image, FIX511.4.1)."""
-    from PIL import Image  # lazy: optional dependency, same pattern as _image_dims_from_url
+    from PIL import Image, ImageOps  # lazy: optional dependency, same pattern as _image_dims_from_url
     obj = s3().get_object(Bucket=R2_BUCKET, Key=storage_key)
     data = obj["Body"].read()
     with Image.open(io.BytesIO(data)) as im:
+        # Bug fix: PIL reads raw pixel data and ignores the EXIF Orientation
+        # tag phone/camera photos are commonly saved with -- browsers
+        # auto-rotate the original for display, but a thumbnail built
+        # straight from im.crop()/resize() came out rotated relative to
+        # that. exif_transpose() physically applies the tag's rotation/flip
+        # once here and drops it, so the saved JPEG needs no tag at all.
+        im = ImageOps.exif_transpose(im)
         im = im.convert("RGB")
         w, h = im.size
         side = min(w, h)
@@ -4269,9 +4276,20 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
                     base = base[: m.start()]
                 new_key = f"{base}_v{n}{dot_ext}"
                 upload_to_bucket(new_key, raw, content_type)
+                # FIX524.4.10.3: the old thumbnail (if any) was built from
+                # bytes this call just replaced -- stale the moment the crop/
+                # rotate is saved, so it's regenerated here under the new
+                # key, same best-effort-non-fatal pattern as confirm_image.
+                try:
+                    _create_thumbnail(new_key)
+                    thumb_created_at = datetime.now()
+                except Exception as e:
+                    print(f"[r2] thumbnail FAILED key={new_key}: {e}", flush=True)
+                    thumb_created_at = None
                 cur.execute(
-                    "update image set storage_key = %s, zoom_factor = %s, bytes = %s where id = %s",
-                    (new_key, zoom_factor, len(raw), image_id),
+                    "update image set storage_key = %s, zoom_factor = %s, bytes = %s, "
+                    "thumb_created_at = %s where id = %s",
+                    (new_key, zoom_factor, len(raw), thumb_created_at, image_id),
                 )
             conn.commit()
         # Best-effort delete of the old object (after commit, so a delete failure
@@ -4279,6 +4297,10 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
         if old_key and old_key != new_key:
             try:
                 _bucket_delete(old_key)
+            except Exception:
+                pass
+            try:
+                _bucket_delete(thumbnail_storage_key(old_key))
             except Exception:
                 pass
         return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
