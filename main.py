@@ -240,6 +240,40 @@ def _backfill_zoom_factors():
         print(f"[backfill-zoom] failed: {e}")
 
 
+def _backfill_thumbnails():
+    """FIX371.6.2.1 / FIX670.20.4 backfill: generate the 400x400 thumbnail
+    for every image that predates those FIX items (thumb_created_at still
+    NULL) -- same converges-over-reboots shape as _backfill_zoom_factors,
+    and a per-image failure (missing/unreadable original) just leaves that
+    one row NULL for next time rather than aborting the batch."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("select id, storage_key from image where thumb_created_at is null")
+                imgs = cur.fetchall()
+        if imgs:
+            print(f"[backfill-thumb] generating {len(imgs)} thumbnails")
+        done = 0
+        for r in imgs:
+            try:
+                _create_thumbnail(r["storage_key"])
+            except Exception as e:
+                print(f"[backfill-thumb] failed key={r['storage_key']}: {e}")
+                continue
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "update image set thumb_created_at = now() where id = %s",
+                        (r["id"],),
+                    )
+                conn.commit()
+            done += 1
+        if imgs:
+            print(f"[backfill-thumb] done ({done}/{len(imgs)} images)")
+    except Exception as e:  # pragma: no cover - log and continue
+        print(f"[backfill-thumb] failed: {e}")
+
+
 @app.on_event("startup")
 def on_startup():
     pool.open()
@@ -257,6 +291,19 @@ def on_startup():
     # FIX521.5.8.0 / FIX521.5.8.1: backfill stored Zoom Factors in the
     # background so boot isn't blocked. Self-limits to NULL-zoom items.
     threading.Thread(target=_backfill_zoom_factors, daemon=True).start()
+    # FIX371.6.2.1 / FIX670.20.4: thumb_created_at tracks which images
+    # already have a thumbnail, so the backfill below (and every future
+    # boot) only touches the ones that don't -- without it, "does this
+    # image have a thumbnail" would mean a live R2 HEAD per image, every
+    # single restart, forever.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("alter table image add column if not exists thumb_created_at timestamptz")
+            conn.commit()
+    except Exception as e:  # pragma: no cover - log and continue
+        print(f"[schema] thumb_created_at ensure failed: {e}")
+    threading.Thread(target=_backfill_thumbnails, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -4429,15 +4476,20 @@ async def confirm_image(request: Request):
             # FIX371.6.2.1 (hard-disk import) / FIX670.20.4 (local-app
             # publication): both flows call this same endpoint, so creating
             # the thumbnail here covers both in one place. Best-effort --
-            # a thumbnail failure must not fail the image upload itself.
+            # a thumbnail failure must not fail the image upload itself, and
+            # leaves thumb_created_at NULL so the startup backfill retries
+            # it later instead of this row being silently stuck without one.
             try:
                 _create_thumbnail(storage_key)
+                thumb_created_at = datetime.now()
             except Exception as e:
                 print(f"[r2] thumbnail FAILED key={storage_key}: {e}", flush=True)
+                thumb_created_at = None
 
             cur.execute(
-                "insert into image (storage_key, zoom_factor, bytes) values (%s, %s, %s) returning id",
-                (storage_key, zoom_factor, obj_bytes),
+                "insert into image (storage_key, zoom_factor, bytes, thumb_created_at) "
+                "values (%s, %s, %s, %s) returning id",
+                (storage_key, zoom_factor, obj_bytes, thumb_created_at),
             )
             image_id = cur.fetchone()["id"]
 
