@@ -49,6 +49,17 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "showcase-images")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "").rstrip("/")  # https://pub-xxxx.r2.dev
+# pub-*.r2.dev is Cloudflare-cached with no purge control available to this
+# app (the R2 API token is object-scoped only, confirmed AccessDenied on
+# both get/put_bucket_cors). Some objects got cached at some edge PoPs
+# before the bucket's CORS policy was set, without the Access-Control-
+# Allow-Origin header the canvas viewer's crossOrigin loads require (plain
+# <img> loads are unaffected, which is why some views showed an image the
+# canvas viewer couldn't). Bumping this forces every image URL to a new
+# cache key app-wide, one line, no per-callsite frontend changes to miss —
+# self-service recovery if this recurs: bump R2_CACHE_BUST in Render's env,
+# no code deploy needed.
+R2_CACHE_BUST = os.environ.get("R2_CACHE_BUST", "1")
 
 _s3_client = None
 
@@ -82,7 +93,7 @@ ALLOWED_ORIGINS = os.environ.get(
 
 
 def public_image_url(storage_key: str) -> str:
-    return f"{R2_PUBLIC_BASE}/{storage_key}"
+    return f"{R2_PUBLIC_BASE}/{storage_key}?cb={R2_CACHE_BUST}"
 
 
 def upload_to_bucket(storage_key: str, data: bytes, content_type: str) -> None:
