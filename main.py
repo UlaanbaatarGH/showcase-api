@@ -3791,12 +3791,23 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_
                 )
 
         conn.commit()
+    # FIX370.4.3.10.1: updated_folders_count must match the frontend
+    # preview's 'Updated item' count -- per_folder alone over-counts (it
+    # includes brand-new folders, which write every imported column
+    # unconditionally and so always show up here too) and under-counts
+    # (a folder whose only change is its ref, via folder_renames, never
+    # gets a properties update and so never enters per_folder at all).
+    # Mirrors the frontend's updatedItemRows: per_folder minus new folders,
+    # union renamed folders.
+    new_folder_id_set = set(new_folder_ids.values())
+    renamed_folder_id_set = {r["id"] for r in folder_renames}
+    updated_folder_id_set = (set(per_folder.keys()) - new_folder_id_set) | renamed_folder_id_set
     return {
         "new_properties_count": len(new_prop_ids),
         "renames_count": len(renames),
         "new_folders_count": len(new_folder_ids),
         "folder_renames_count": len(folder_renames),
-        "updated_folders_count": len(per_folder),
+        "updated_folders_count": len(updated_folder_id_set),
     }
 
 
