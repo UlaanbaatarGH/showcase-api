@@ -96,6 +96,38 @@ def public_image_url(storage_key: str) -> str:
     return f"{R2_PUBLIC_BASE}/{storage_key}?cb={R2_CACHE_BUST}"
 
 
+# FIX371.6.2.1 / FIX670.20.4: 400x400 centre-cropped JPEG q80, stored
+# alongside the original under its own key -- always .jpg regardless of the
+# original's format, since the thumbnail format is fixed by spec.
+def thumbnail_storage_key(storage_key: str) -> str:
+    base = storage_key.rsplit(".", 1)[0] if "." in storage_key.rsplit("/", 1)[-1] else storage_key
+    return f"{base}_thumb.jpg"
+
+
+def thumbnail_url(storage_key: str) -> str:
+    return public_image_url(thumbnail_storage_key(storage_key))
+
+
+def _create_thumbnail(storage_key: str) -> None:
+    """FIX371.6.2.1 / FIX670.20.4: read the just-uploaded original back from
+    R2, centre-crop to a 400x400 JPEG (quality 80), upload it under
+    thumbnail_storage_key(storage_key). Best-effort -- called from
+    confirm_image, where a thumbnail failure must not fail the image
+    upload itself (the gallery falls back to the full image, FIX511.4.1)."""
+    from PIL import Image  # lazy: optional dependency, same pattern as _image_dims_from_url
+    obj = s3().get_object(Bucket=R2_BUCKET, Key=storage_key)
+    data = obj["Body"].read()
+    with Image.open(io.BytesIO(data)) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        im = im.crop((left, top, left + side, top + side)).resize((400, 400), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=80)
+    upload_to_bucket(thumbnail_storage_key(storage_key), buf.getvalue(), "image/jpeg")
+
+
 def upload_to_bucket(storage_key: str, data: bytes, content_type: str) -> None:
     try:
         s3().put_object(
@@ -3101,6 +3133,13 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "main_image_url": (
                 public_image_url(r["main_storage_key"]) if r["main_storage_key"] else None
             ),
+            # FIX511.4.1: the Item Gallery panel displays this instead of
+            # main_image_url. May not exist for images uploaded before
+            # FIX371.6.2.1/FIX670.20.4 -- the frontend falls back to
+            # main_image_url on load error rather than backfilling here.
+            "main_image_thumb_url": (
+                thumbnail_url(r["main_storage_key"]) if r["main_storage_key"] else None
+            ),
             "main_rotation": r["main_rotation"],
             "has_image": bool(r["has_image"]),
             # FIX504.2.1.2.2.4 <Image size>: sum of this item's image bytes.
@@ -4386,6 +4425,16 @@ async def confirm_image(request: Request):
             except Exception as e:
                 print(f"[r2] confirm head FAILED key={storage_key}: {e}", flush=True)
                 obj_bytes = None
+
+            # FIX371.6.2.1 (hard-disk import) / FIX670.20.4 (local-app
+            # publication): both flows call this same endpoint, so creating
+            # the thumbnail here covers both in one place. Best-effort --
+            # a thumbnail failure must not fail the image upload itself.
+            try:
+                _create_thumbnail(storage_key)
+            except Exception as e:
+                print(f"[r2] thumbnail FAILED key={storage_key}: {e}", flush=True)
+
             cur.execute(
                 "insert into image (storage_key, zoom_factor, bytes) values (%s, %s, %s) returning id",
                 (storage_key, zoom_factor, obj_bytes),
