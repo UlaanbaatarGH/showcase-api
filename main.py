@@ -4560,7 +4560,8 @@ def list_folder_images(folder_id: int):
                   img.storage_key,
                   img.rotation,
                   img.crop,
-                  img.zoom_factor
+                  img.zoom_factor,
+                  img.thumb_created_at
                 from folder_image fi
                 join image img on img.id = fi.image_id
                 where fi.folder_id = %s
@@ -4582,6 +4583,10 @@ def list_folder_images(folder_id: int):
             # originally uploaded (with the versioning suffix appended).
             "filename": r["storage_key"].rsplit("/", 1)[-1],
             "url": public_image_url(r["storage_key"]),
+            # Same field the Item Gallery's main_image_thumb_url uses
+            # (/api/showcase) -- lets the editor push a freshly-set main
+            # image straight into the gallery's cache without a refetch.
+            "thumb_url": thumbnail_url(r["storage_key"], r["thumb_created_at"]),
             "rotation": r["rotation"],
             "crop": r["crop"],
             # FIX521.5.8.1 <img-zoom-factor>: stored per-image Zoom Factor.
