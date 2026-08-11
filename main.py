@@ -92,7 +92,20 @@ ALLOWED_ORIGINS = os.environ.get(
 ).split(",")
 
 
-def public_image_url(storage_key: str) -> str:
+# TECH bug fix: same class of bug as thumbnail_url's cb -- the static
+# global R2_CACHE_BUST token means every full-image URL is identical
+# forever, so if R2's CORS policy (or any other origin-response detail)
+# ever changed AFTER a given image was first fetched, edges that already
+# cached the old response under the "immutable, max-age=1y" header keep
+# serving it -- including a stale response with no Access-Control-Allow-
+# Origin header, which the browser reports as a CORS error even though
+# the object itself is fine (confirmed live: a direct HTTP GET/HEAD with
+# Origin set returns a proper CORS header today). A caller with the
+# image's own created_at gets a URL that's never been cached anywhere,
+# sidestepping the whole class of staleness.
+def public_image_url(storage_key: str, created_at=None) -> str:
+    if created_at is not None:
+        return f"{R2_PUBLIC_BASE}/{storage_key}?cb={int(created_at.timestamp())}"
     return f"{R2_PUBLIC_BASE}/{storage_key}?cb={R2_CACHE_BUST}"
 
 
@@ -3073,6 +3086,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
                   img.thumb_created_at as main_thumb_created_at,
+                  img.created_at as main_created_at,
                   exists (select 1 from folder_image where folder_id = f.id) as has_image,
                   -- FIX504.2.1.2.2.4 <Image size>: total bytes of this item's
                   -- images, summed from the image table's stored byte size.
@@ -3194,7 +3208,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "sort_order": r["sort_order"],
             "properties": r["properties"] or {},
             "main_image_url": (
-                public_image_url(r["main_storage_key"]) if r["main_storage_key"] else None
+                public_image_url(r["main_storage_key"], r["main_created_at"])
+                if r["main_storage_key"] else None
             ),
             # FIX511.4.1: the Item Gallery panel displays this instead of
             # main_image_url. May not exist for images uploaded before
@@ -4561,7 +4576,8 @@ def list_folder_images(folder_id: int):
                   img.rotation,
                   img.crop,
                   img.zoom_factor,
-                  img.thumb_created_at
+                  img.thumb_created_at,
+                  img.created_at
                 from folder_image fi
                 join image img on img.id = fi.image_id
                 where fi.folder_id = %s
@@ -4582,7 +4598,7 @@ def list_folder_images(folder_id: int):
             # "pN/<item>/<filename>"; the basename is what the user
             # originally uploaded (with the versioning suffix appended).
             "filename": r["storage_key"].rsplit("/", 1)[-1],
-            "url": public_image_url(r["storage_key"]),
+            "url": public_image_url(r["storage_key"], r["created_at"]),
             # Same field the Item Gallery's main_image_thumb_url uses
             # (/api/showcase) -- lets the editor push a freshly-set main
             # image straight into the gallery's cache without a refetch.
