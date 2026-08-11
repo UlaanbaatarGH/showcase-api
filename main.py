@@ -104,7 +104,15 @@ def thumbnail_storage_key(storage_key: str) -> str:
     return f"{base}_thumb.jpg"
 
 
-def thumbnail_url(storage_key: str) -> str:
+# TECH: cb defaults to the global R2_CACHE_BUST token, but a caller with a
+# per-image thumb_created_at should pass it instead -- the object is
+# regenerated in place under the same key (rotation-fix backfills,
+# replace-bytes), and the global token doesn't change on that, so R2's
+# public-domain "immutable, max-age=1y" header keeps every edge/browser
+# cache pinned to the stale bytes at that URL until the URL itself changes.
+def thumbnail_url(storage_key: str, thumb_created_at=None) -> str:
+    if thumb_created_at is not None:
+        return f"{R2_PUBLIC_BASE}/{thumbnail_storage_key(storage_key)}?cb={int(thumb_created_at.timestamp())}"
     return public_image_url(thumbnail_storage_key(storage_key))
 
 
@@ -3064,6 +3072,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   f.zoom_factor,
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
+                  img.thumb_created_at as main_thumb_created_at,
                   exists (select 1 from folder_image where folder_id = f.id) as has_image,
                   -- FIX504.2.1.2.2.4 <Image size>: total bytes of this item's
                   -- images, summed from the image table's stored byte size.
@@ -3192,7 +3201,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # FIX371.6.2.1/FIX670.20.4 -- the frontend falls back to
             # main_image_url on load error rather than backfilling here.
             "main_image_thumb_url": (
-                thumbnail_url(r["main_storage_key"]) if r["main_storage_key"] else None
+                thumbnail_url(r["main_storage_key"], r["main_thumb_created_at"])
+                if r["main_storage_key"] else None
             ),
             "main_rotation": r["main_rotation"],
             "has_image": bool(r["has_image"]),
