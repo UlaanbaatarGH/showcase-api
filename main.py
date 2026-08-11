@@ -4642,10 +4642,11 @@ async def update_folder_image(
     if not updates:
         raise HTTPException(status_code=400, detail="nothing to update")
 
+    sort_order_changed = "sort_order" in payload
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select id, folder_id from folder_image where id = %s",
+                "select id, folder_id, image_id from folder_image where id = %s",
                 (folder_image_id,),
             )
             existing = cur.fetchone()
@@ -4663,6 +4664,46 @@ async def update_folder_image(
                 (*params, folder_image_id),
             )
             row = cur.fetchone()
+
+            # FIX521.5.9: the item's thumbnail (main_image_thumb_url, which
+            # always resolves to whichever image is main or -- lacking a
+            # main -- first by sort_order) must actually have one generated
+            # once it becomes that image, in case it predates the
+            # FIX371.6.2.1/FIX670.20.4 backfill or a prior thumbnail attempt
+            # failed. Best-effort, same posture as confirm_image's own
+            # thumbnail generation -- must not fail this PATCH.
+            image_id_to_check = None
+            if set_is_main_true:
+                image_id_to_check = existing["image_id"]
+            elif sort_order_changed and not row["is_main"]:
+                cur.execute(
+                    "select 1 from folder_image where folder_id = %s and is_main = true limit 1",
+                    (existing["folder_id"],),
+                )
+                if not cur.fetchone():
+                    cur.execute(
+                        "select image_id from folder_image where folder_id = %s "
+                        "order by sort_order, id limit 1",
+                        (existing["folder_id"],),
+                    )
+                    first = cur.fetchone()
+                    if first and first["image_id"] == existing["image_id"]:
+                        image_id_to_check = existing["image_id"]
+            if image_id_to_check is not None:
+                cur.execute(
+                    "select storage_key, thumb_created_at from image where id = %s",
+                    (image_id_to_check,),
+                )
+                img = cur.fetchone()
+                if img and img["thumb_created_at"] is None:
+                    try:
+                        _create_thumbnail(img["storage_key"])
+                        cur.execute(
+                            "update image set thumb_created_at = now() where id = %s",
+                            (image_id_to_check,),
+                        )
+                    except Exception as e:
+                        print(f"[folder-image] FIX521.5.9 thumbnail FAILED image_id={image_id_to_check}: {e}", flush=True)
         conn.commit()
     return {
         "id": row["id"],
