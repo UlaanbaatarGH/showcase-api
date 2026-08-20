@@ -1,5 +1,5 @@
 -- Showcase V0.4: auth, multi-project, Master Folders
--- Covers FIX300 (Access Rights), FIX310 (User), FIX350 (Project + Master Folder tree).
+-- Covers FIX310 (User), FIX350 (Project + Master Folder tree).
 -- Idempotent: safe to re-run.
 
 
@@ -28,7 +28,7 @@ alter table project
 
 
 -- ============================================================
--- FIX310.1.4 + FIX300: per-user per-project access rights
+-- FIX310.1.4: per-user per-project access rights
 -- ============================================================
 -- Rights stored as a subset of 'CRUD' letters (e.g. '', 'R', 'CRU', 'CRUD').
 -- group2 maps to FIX350.10.1.2 actions, group3 to FIX350.10.1.3 actions.

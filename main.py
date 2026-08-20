@@ -353,7 +353,7 @@ def health():
 
 
 # ============================================================
-# FIX310 + FIX300: auth helpers (Supabase JWT verification)
+# FIX310: auth helpers (Supabase JWT verification)
 # ============================================================
 def _verify_token(token: str) -> dict:
     # Validate the access token by asking Supabase directly. This works
