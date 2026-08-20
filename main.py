@@ -39,7 +39,7 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # required for authenti
 # requirement entirely, so an unauthenticated request against this backend
 # is treated as the trusted local admin instead of anonymous.
 LOCAL_APP = os.environ.get("LOCAL_APP") == "1"
-LOCAL_APP_USER_ID = "cff25e93-75f6-4dc7-950a-7a53ddd7d813"  # Herve, app_user.profile='admin'
+LOCAL_APP_USER_ID = "cff25e93-75f6-4dc7-950a-7a53ddd7d813"  # Herve, app_user.is_admin=true
 
 # Cloudflare R2 (S3-compatible) — image object storage. The database and auth
 # stay in Supabase; only image FILES live in R2. Public reads come from
@@ -399,15 +399,15 @@ def current_user_required(request: Request) -> dict:
     return user
 
 
-# FIX311 / FIX410: admin endpoints require profile = 'admin' on
+# FIX311 / FIX410: admin endpoints require is_admin = true on
 # app_user, on top of a valid Supabase token.
 def current_admin_required(request: Request) -> dict:
     user = current_user_required(request)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            cur.execute("select is_admin from app_user where id = %s", (user["id"],))
             row = cur.fetchone()
-    if not row or row["profile"] != "admin":
+    if not row or not row["is_admin"]:
         raise HTTPException(status_code=403, detail="admin access required")
     return user
 
@@ -429,7 +429,7 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
             cur.execute(
                 "insert into app_user (id, login_name) values (%s, %s) "
                 "on conflict (id) do update set login_name = app_user.login_name "
-                "returning id, login_name, profile, created_at",
+                "returning id, login_name, is_admin, created_at",
                 (user["id"], login_name),
             )
             row = cur.fetchone()
@@ -470,7 +470,7 @@ def get_me(user=Depends(current_user_required)):
             cur.execute(
                 # FIX420.4.2.5: surface the user's email so the Contact
                 # panel can pre-fill <msg-reply-addr> when signed in.
-                "select id, login_name, email, profile, created_at "
+                "select id, login_name, email, is_admin, created_at "
                 "from app_user where id = %s",
                 (user["id"],),
             )
@@ -659,7 +659,7 @@ def _user_row_to_dict(row, projects, see_sensitive=True):
         "name": row["login_name"],
         "email": row["email"] if see_sensitive else None,
         "access_code": row["access_code"] if see_sensitive else None,
-        "is_admin": row["profile"] == "admin",
+        "is_admin": bool(row["is_admin"]),
         "has_password": bool(row.get("has_password")),
         "projects": projects,
     }
@@ -676,9 +676,9 @@ def list_users(user=Depends(current_user_required)):
     # have at least one project in common with the manager.
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            cur.execute("select is_admin from app_user where id = %s", (user["id"],))
             pr = cur.fetchone()
-            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            caller_is_admin = bool(pr and pr["is_admin"])
             cur.execute(
                 "select project_id from project_access where user_id = %s",
                 (user["id"],),
@@ -689,7 +689,7 @@ def list_users(user=Depends(current_user_required)):
             # Admin-created users without a Supabase Auth row stay
             # unchecked until they redeem their access code.
             cur.execute(
-                "select u.id, u.login_name, u.email, u.access_code, u.profile, "
+                "select u.id, u.login_name, u.email, u.access_code, u.is_admin, "
                 "       (au.encrypted_password is not null) as has_password "
                 "from app_user u "
                 "left join auth.users au on au.id = u.id "
@@ -748,12 +748,12 @@ async def create_user(request: Request, _admin=Depends(current_admin_required)):
             )
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="email already in use")
-            # FIX311.3.1.1.2: profile defaults to 'common' — never admin
+            # FIX311.3.1.1.2: is_admin defaults to false — never admin
             # via this flow. FIX311.3.1.1.4: project access stays empty.
             cur.execute(
-                "insert into app_user (id, login_name, email, profile, access_code) "
-                "values (gen_random_uuid(), %s, %s, 'common', %s) "
-                "returning id, login_name, email, access_code, profile",
+                "insert into app_user (id, login_name, email, access_code) "
+                "values (gen_random_uuid(), %s, %s, %s) "
+                "returning id, login_name, email, access_code, is_admin",
                 (name, email, access_code),
             )
             row = cur.fetchone()
@@ -1263,7 +1263,7 @@ async def redeem_account(request: Request):
 async def signup_visitor(request: Request):
     """FIX316.2.1 (Visitor flow): self-signup for a lambda visitor
     account. No access code required. Body: { name, password, email }.
-    Creates a fresh app_user row with profile='visitor' and the
+    Creates a fresh app_user row (non-admin, no project access) and the
     matching Supabase Auth row. The frontend signs in immediately
     after."""
     payload = await request.json() if await request.body() else {}
@@ -1304,8 +1304,8 @@ async def signup_visitor(request: Request):
                     detail="Supabase did not return a new user id",
                 )
             cur.execute(
-                "insert into app_user (id, login_name, email, profile) "
-                "values (%s, %s, %s, 'visitor')",
+                "insert into app_user (id, login_name, email) "
+                "values (%s, %s, %s)",
                 (new_id, name, email),
             )
         conn.commit()
@@ -1588,11 +1588,11 @@ def list_contact_messages(
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select profile from app_user where id = %s",
+                "select is_admin from app_user where id = %s",
                 (user["id"],),
             )
             pr = cur.fetchone()
-            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            caller_is_admin = bool(pr and pr["is_admin"])
             # Non-admin callers see only messages tied to projects
             # they have any project_access row for.
             allowed_ids = None
@@ -1683,11 +1683,11 @@ def list_admin_projects(user=Depends(current_user_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select profile from app_user where id = %s",
+                "select is_admin from app_user where id = %s",
                 (user["id"],),
             )
             pr = cur.fetchone()
-            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            caller_is_admin = bool(pr and pr["is_admin"])
             if caller_is_admin:
                 cur.execute(
                     "select id, name, is_public, sort_order, "
@@ -1855,9 +1855,8 @@ async def create_admin_project(request: Request, _admin=Depends(current_admin_re
             for mid in manager_ids:
                 cur.execute(
                     "insert into project_access "
-                    "(user_id, project_id, is_data_manager, is_user_manager, "
-                    " group2_rights, group3_rights) "
-                    "values (%s, %s, true, true, 'CRUD', 'CRUD')",
+                    "(user_id, project_id, is_data_manager, is_user_manager) "
+                    "values (%s, %s, true, true)",
                     (mid, row["id"]),
                 )
         conn.commit()
@@ -1909,9 +1908,9 @@ async def update_admin_project(
             # FIX351.5.7: caller must be admin or User Manager of this
             # project. FIX352.3.10.11: only admins may touch
             # <project-user-managers>.
-            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            cur.execute("select is_admin from app_user where id = %s", (user["id"],))
             pr = cur.fetchone()
-            caller_is_admin = bool(pr and pr["profile"] == "admin")
+            caller_is_admin = bool(pr and pr["is_admin"])
             if not caller_is_admin:
                 cur.execute(
                     "select 1 from project_access "
@@ -1973,9 +1972,8 @@ async def update_admin_project(
                 for uid in all_set:
                     cur.execute(
                         "insert into project_access "
-                        "(user_id, project_id, is_data_manager, is_user_manager, "
-                        " group2_rights, group3_rights) "
-                        "values (%s, %s, %s, %s, 'CRUD', 'CRUD')",
+                        "(user_id, project_id, is_data_manager, is_user_manager) "
+                        "values (%s, %s, %s, %s)",
                         (uid, project_id, uid in data_set, uid in user_set),
                     )
                 # FIX507.4.3: the roster rebuild above may have dropped or
@@ -2604,9 +2602,9 @@ def _require_admin_or_user_manager_of(cur, caller_id: str, project_id: int) -> N
     for project P is allowed only when the caller is a global admin
     OR a User Manager of P (project_access row with is_user_manager
     true). Plain Data Managers cannot grant access to others."""
-    cur.execute("select profile from app_user where id = %s", (caller_id,))
+    cur.execute("select is_admin from app_user where id = %s", (caller_id,))
     pr = cur.fetchone()
-    if pr and pr["profile"] == "admin":
+    if pr and pr["is_admin"]:
         return
     cur.execute(
         "select 1 from project_access "
@@ -2640,7 +2638,7 @@ def _disable_raters_without_rights(cur, project_id, user_id=None):
         where pr.project_id = %s {user_filter}
           and pr.enabled
           and not exists (
-            select 1 from app_user u where u.id = pr.user_id and u.profile = 'admin'
+            select 1 from app_user u where u.id = pr.user_id and u.is_admin
           )
           and not exists (
             select 1 from project_access pa
@@ -2676,9 +2674,8 @@ def grant_user_project(
             # admin-only via <panel-project> (FIX352.3.10.11).
             cur.execute(
                 "insert into project_access "
-                "(user_id, project_id, is_data_manager, is_user_manager, "
-                " group2_rights, group3_rights) "
-                "values (%s, %s, true, false, 'CRUD', 'CRUD') "
+                "(user_id, project_id, is_data_manager, is_user_manager) "
+                "values (%s, %s, true, false) "
                 "on conflict (user_id, project_id) do nothing",
                 (user_id, project_id),
             )
@@ -2758,11 +2755,11 @@ def list_projects(user=Depends(current_user_optional)):
             else:
                 # Admins see every project regardless of visibility flags.
                 cur.execute(
-                    "select profile from app_user where id = %s",
+                    "select is_admin from app_user where id = %s",
                     (user["id"],),
                 )
                 pr = cur.fetchone()
-                is_caller_admin = bool(pr and pr["profile"] == "admin")
+                is_caller_admin = bool(pr and pr["is_admin"])
                 if is_caller_admin:
                     cur.execute(
                         "select p.id, p.name, p.cover_image_key, p.is_public, "
@@ -2841,9 +2838,9 @@ async def update_project(
             # be recorded as owner), the owner, or anyone if the project is
             # still unowned — in which case we auto-claim ownership below so
             # subsequent edits stick to this user.
-            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            cur.execute("select is_admin from app_user where id = %s", (user["id"],))
             pr = cur.fetchone()
-            is_admin = bool(pr and pr["profile"] == "admin")
+            is_admin = bool(pr and pr["is_admin"])
             if not is_admin and row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
             auto_claim = row["owner_id"] is None
@@ -2913,9 +2910,9 @@ async def sign_project_cover_upload(
             # passes regardless of owner_id (see PATCH /api/projects/:id
             # for why: an orphaned/mismatched owner_id must never lock an
             # admin out).
-            cur.execute("select profile from app_user where id = %s", (user["id"],))
+            cur.execute("select is_admin from app_user where id = %s", (user["id"],))
             pr = cur.fetchone()
-            is_admin = bool(pr and pr["profile"] == "admin")
+            is_admin = bool(pr and pr["is_admin"])
             if not is_admin and row["owner_id"] is not None and row["owner_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="not owner")
 
@@ -3048,11 +3045,11 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             is_admin_or_manager = False
             if user is not None:
                 cur.execute(
-                    "select profile from app_user where id = %s",
+                    "select is_admin from app_user where id = %s",
                     (user["id"],),
                 )
                 pr = cur.fetchone()
-                if pr and pr["profile"] == "admin":
+                if pr and pr["is_admin"]:
                     is_admin_or_manager = True
                 else:
                     cur.execute(
@@ -3141,7 +3138,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # union this project's data managers (same is_data_manager flag
             # FIX351.2.1.2 / list_projects already reads).
             cur.execute(
-                "select id, login_name as name from app_user where profile = 'admin' "
+                "select id, login_name as name from app_user where is_admin "
                 "union "
                 "select u.id, u.login_name as name from app_user u "
                 "join project_access pa on pa.user_id = u.id "
