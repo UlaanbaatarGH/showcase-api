@@ -1745,7 +1745,8 @@ def list_admin_projects(user=Depends(current_user_required)):
                     "from project p "
                     "join project_access pa on pa.project_id = p.id "
                     "where pa.user_id = %s "
-                    "  and (pa.is_data_manager or pa.is_user_manager) "
+                    "  and (pa.is_data_manager or pa.is_user_manager "
+                    "       or pa.is_layout_mngr or pa.is_setup_mngr) "
                     "group by p.id "
                     "order by p.sort_order, p.id",
                     (user["id"],),
@@ -1766,7 +1767,8 @@ def list_admin_projects(user=Depends(current_user_required)):
                 })
             cur.execute(
                 "select pa.project_id, pa.user_id, u.login_name, "
-                "       pa.is_data_manager, pa.is_user_manager "
+                "       pa.is_viewer, pa.is_rater, pa.is_layout_mngr, "
+                "       pa.is_data_manager, pa.is_user_manager, pa.is_setup_mngr "
                 "from project_access pa "
                 "join app_user u on u.id = pa.user_id "
                 "order by u.login_name"
@@ -1792,26 +1794,34 @@ def list_admin_projects(user=Depends(current_user_required)):
             )
             bytes_rows = cur.fetchall()
     bytes_by_proj = {r["project_id"]: int(r["bytes"] or 0) for r in bytes_rows}
-    data_by_proj = {}
-    user_by_proj = {}
+    # FIX300 / FIX351.2.1.{2,5,7,8,9,10}: one list per role, each keyed
+    # off its own project_access boolean column.
+    role_cols = {
+        "viewers": "is_viewer",
+        "raters": "is_rater",
+        "layout_mngrs": "is_layout_mngr",
+        "data_managers": "is_data_manager",
+        "user_managers": "is_user_manager",
+        "setup_mngrs": "is_setup_mngr",
+    }
+    by_role: dict[str, dict[int, list]] = {key: {} for key in role_cols}
     for r in access_rows:
         entry = {"id": str(r["user_id"]), "name": r["login_name"]}
-        if r["is_data_manager"]:
-            data_by_proj.setdefault(r["project_id"], []).append(entry)
-        if r["is_user_manager"]:
-            user_by_proj.setdefault(r["project_id"], []).append(entry)
+        for key, col in role_cols.items():
+            if r[col]:
+                by_role[key].setdefault(r["project_id"], []).append(entry)
     return [
         {
             "id": p["id"],
             "name": p["name"],
             "is_public": bool(p["is_public"]),
             # `managers` kept for backward-compat callers — the union
-            # of both roles, deduped by user id.
+            # of the data + user manager roles, deduped by user id.
             "managers": _dedup_by_id(
-                data_by_proj.get(p["id"], []) + user_by_proj.get(p["id"], []),
+                by_role["data_managers"].get(p["id"], [])
+                + by_role["user_managers"].get(p["id"], []),
             ),
-            "data_managers": data_by_proj.get(p["id"], []),
-            "user_managers": user_by_proj.get(p["id"], []),
+            **{key: lists.get(p["id"], []) for key, lists in by_role.items()},
             "image_bytes": bytes_by_proj.get(p["id"], 0),
             # FIX352.2.5 / .2.6 / .2.10
             "front_introduction": p.get("front_introduction") or "",
@@ -1920,6 +1930,12 @@ async def update_admin_project(
     is_public = payload.get("is_public")  # bool or None to skip
     data_managers = payload.get("data_managers")
     user_managers = payload.get("user_managers")
+    # FIX300: the other 4 roles, same "None = don't touch this role"
+    # convention as data_managers / user_managers.
+    viewers = payload.get("viewers")
+    raters = payload.get("raters")
+    layout_mngrs = payload.get("layout_mngrs")
+    setup_mngrs = payload.get("setup_mngrs")
     # FIX352.2.5 / .2.6: free-form intros (None = skip; '' = clear).
     front_introduction = payload.get("front_introduction")
     introduction = payload.get("introduction")
@@ -1991,37 +2007,55 @@ async def update_admin_project(
                     "update project set name = %s where id = %s",
                     (new_name, project_id),
                 )
-            # FIX352.3.10.10: replace the manager rosters. We rebuild
-            # the project_access rows for this project from the union
-            # of (data_managers, user_managers); each row carries both
-            # role flags as appropriate.
+            # FIX300 / FIX352.3.10.10: each role is independently
+            # settable — a role omitted from the payload (None) is left
+            # exactly as it is in the DB; only roles the caller actually
+            # sent get rewritten, so e.g. saving Data Managers never
+            # wipes Viewers/Raters/User Managers/etc. A user newly
+            # appearing in any sent role gets a project_access row
+            # (is_viewer true by default per FIX300.3.10.1.1 — being
+            # assigned to the project at all implies Viewer unless that
+            # role is itself explicitly turned off in the same save).
             # Note: no `password set` precondition here — under the
             # new flow grant_user_project legitimately adds users that
-            # haven't redeemed yet (FIX317). They appear as data
-            # managers but can't act as managers until they redeem.
-            if data_managers is not None or user_managers is not None or legacy_managers is not None:
-                if legacy_managers is not None:
-                    data_set = set(legacy_managers or [])
-                    user_set = set(legacy_managers or [])
-                else:
-                    data_set = set(data_managers or [])
-                    user_set = set(user_managers or [])
-                all_set = data_set | user_set
-                cur.execute(
-                    "delete from project_access where project_id = %s",
-                    (project_id,),
-                )
-                for uid in all_set:
+            # haven't redeemed yet (FIX317). They appear as managers
+            # but can't act as managers until they redeem.
+            role_updates: dict[str, set] = {}
+            if legacy_managers is not None:
+                role_updates["is_data_manager"] = set(legacy_managers or [])
+                role_updates["is_user_manager"] = set(legacy_managers or [])
+            else:
+                if viewers is not None:
+                    role_updates["is_viewer"] = set(viewers or [])
+                if raters is not None:
+                    role_updates["is_rater"] = set(raters or [])
+                if layout_mngrs is not None:
+                    role_updates["is_layout_mngr"] = set(layout_mngrs or [])
+                if data_managers is not None:
+                    role_updates["is_data_manager"] = set(data_managers or [])
+                if user_managers is not None:
+                    role_updates["is_user_manager"] = set(user_managers or [])
+                if setup_mngrs is not None:
+                    role_updates["is_setup_mngr"] = set(setup_mngrs or [])
+            if role_updates:
+                all_uids: set = set()
+                for uid_set in role_updates.values():
+                    all_uids |= uid_set
+                for uid in all_uids:
                     cur.execute(
-                        "insert into project_access "
-                        "(user_id, project_id, is_data_manager, is_user_manager) "
-                        "values (%s, %s, %s, %s)",
-                        (uid, project_id, uid in data_set, uid in user_set),
+                        "insert into project_access (user_id, project_id) "
+                        "values (%s, %s) "
+                        "on conflict (user_id, project_id) do nothing",
+                        (uid, project_id),
                     )
-                # FIX507.4.3: the roster rebuild above may have dropped or
-                # demoted any number of users at once -- re-check every
-                # rater of this project rather than a single user_id.
-                _disable_raters_without_rights(cur, project_id)
+                for col, uid_set in role_updates.items():
+                    cur.execute(
+                        f"update project_access set {col} = (user_id = any(%s::uuid[])) "
+                        "where project_id = %s",
+                        (list(uid_set), project_id),
+                    )
+                if "is_rater" in role_updates:
+                    _sync_project_rater_for_project(cur, project_id)
             # FIX352.2.5 / .2.6: persist the introductions.
             if front_introduction is not None:
                 cur.execute(
@@ -2543,7 +2577,10 @@ def clear_project_managers(project_id: int, _admin=Depends(current_admin_require
                 "delete from project_access where project_id = %s",
                 (project_id,),
             )
-            _disable_raters_without_rights(cur, project_id)
+            cur.execute(
+                "delete from project_rater where project_id = %s",
+                (project_id,),
+            )
         conn.commit()
     return {"ok": True}
 
@@ -2660,35 +2697,26 @@ def _require_admin_or_user_manager_of(cur, caller_id: str, project_id: int) -> N
         )
 
 
-def _disable_raters_without_rights(cur, project_id, user_id=None):
-    """FIX507.4.3: a <table-users-allowed-to-rate> row is auto-disabled
-    (never deleted, never re-enabled here) once its user no longer has
-    admin or data-manager rights on the project -- losing project
-    access entirely, or being demoted off the data-manager list. Global
-    admins are exempt since FIX507.2.3.1.12.1 always allows them.
-    `user_id` narrows the check to one user (e.g. after a single
-    revoke); omit it to re-check every rater of the project (e.g.
-    after a bulk manager-roster rebuild)."""
-    params = [project_id]
-    user_filter = ""
-    if user_id is not None:
-        user_filter = "and pr.user_id = %s"
-        params.append(user_id)
+def _sync_project_rater_for_project(cur, project_id):
+    """FIX507.2.3(removed) / FIX300 <role-rater>: project_rater is a
+    plain (project_id, user_id) mirror of project_access.is_rater --
+    kept only so existing view_setup grouping columns
+    ({"type": "user_rating", "rater_id": N}) keep resolving to a
+    stable id (see migration 043). Call after any change to is_rater
+    for this project."""
     cur.execute(
-        f"""
-        update project_rater pr set enabled = false
-        where pr.project_id = %s {user_filter}
-          and pr.enabled
-          and not exists (
-            select 1 from app_user u where u.id = pr.user_id and u.is_admin
-          )
-          and not exists (
-            select 1 from project_access pa
-            where pa.project_id = pr.project_id and pa.user_id = pr.user_id
-              and pa.is_data_manager
-          )
-        """,
-        params,
+        "insert into project_rater (project_id, user_id) "
+        "select project_id, user_id from project_access "
+        "where project_id = %s and is_rater "
+        "on conflict (project_id, user_id) do nothing",
+        (project_id,),
+    )
+    cur.execute(
+        "delete from project_rater where project_id = %s and user_id != all("
+        "  select user_id from project_access "
+        "  where project_id = %s and is_rater"
+        ")",
+        (project_id, project_id),
     )
 
 
@@ -2711,13 +2739,13 @@ def grant_user_project(
             cur.execute("select 1 from project where id = %s", (project_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="project not found")
-            # New row defaults to (is_data_manager=true,
-            # is_user_manager=false). Promotion to User Manager is
-            # admin-only via <panel-project> (FIX352.3.10.11).
+            # FIX300.3.10.1.1: new row defaults to Viewer only (the
+            # is_viewer column default) -- every other role, including
+            # Data/User Manager, is granted separately via
+            # <panel-project> (FIX352.3.10.10).
             cur.execute(
-                "insert into project_access "
-                "(user_id, project_id, is_data_manager, is_user_manager) "
-                "values (%s, %s, true, false) "
+                "insert into project_access (user_id, project_id) "
+                "values (%s, %s) "
                 "on conflict (user_id, project_id) do nothing",
                 (user_id, project_id),
             )
@@ -2743,7 +2771,11 @@ def revoke_user_project(
                 "where user_id = %s and project_id = %s",
                 (user_id, project_id),
             )
-            _disable_raters_without_rights(cur, project_id, user_id)
+            # Losing project access entirely also drops <role-rater>.
+            cur.execute(
+                "delete from project_rater where user_id = %s and project_id = %s",
+                (user_id, project_id),
+            )
         conn.commit()
     return {"ok": True}
 
@@ -3073,7 +3105,6 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                         "enabled": False, "values": [], "raters": [],
                         "show_conflict": False, "conflict_threshold": 2,
                     },
-                    "rating_candidates": [],
                 }
             # FIX503.4.1: caller is admin (global role) or Manager of the
             # project (Users listed in <project-managers>, i.e. the Data
@@ -3086,6 +3117,12 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # affordances to callers who aren't actually Data Managers.
             is_admin_or_manager = False
             caller_is_admin = False
+            # FIX300.3.10.3.2 / FIX300.3.10.6.2: <button-item-grouping> /
+            # <button-columns> gate on Layout Manager, <button-setup>
+            # gates on Setup Manager -- both admin-exempt like every
+            # other role check here.
+            is_layout_mngr = False
+            is_setup_mngr = False
             if user is not None:
                 cur.execute(
                     "select is_admin from app_user where id = %s",
@@ -3095,13 +3132,19 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 caller_is_admin = bool(pr and pr["is_admin"])
                 if caller_is_admin:
                     is_admin_or_manager = True
+                    is_layout_mngr = True
+                    is_setup_mngr = True
                 else:
                     cur.execute(
-                        "select 1 from project_access "
-                        "where project_id = %s and user_id = %s and is_data_manager",
+                        "select is_data_manager, is_layout_mngr, is_setup_mngr "
+                        "from project_access "
+                        "where project_id = %s and user_id = %s",
                         (project["id"], user["id"]),
                     )
-                    is_admin_or_manager = cur.fetchone() is not None
+                    pa = cur.fetchone()
+                    is_admin_or_manager = bool(pa and pa["is_data_manager"])
+                    is_layout_mngr = bool(pa and pa["is_layout_mngr"])
+                    is_setup_mngr = bool(pa and pa["is_setup_mngr"])
             # FIX410.1.1.6.2: "no one can open any project ... admin
             # excepted". Frontend already redirects away from the project
             # route in this state; this is the API-level backstop for a
@@ -3172,31 +3215,19 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 (project["id"],),
             )
             rating_values = cur.fetchall()
-            # FIX507.2.3.1 <table-users-allowed-to-rate>: joined to
-            # app_user for the display name.
+            # FIX300 <role-rater> / FIX507.2.3(removed): project_rater is
+            # kept in sync with project_access.is_rater (see
+            # _sync_project_rater_for_project) purely so its id stays a
+            # stable rater_id for view_setup grouping columns -- no more
+            # acronym/enabled, membership is <role-rater> itself now.
             cur.execute(
-                "select pr.id, pr.user_id, u.login_name as name, "
-                "       pr.acronym, pr.enabled "
+                "select pr.id, pr.user_id, u.login_name as name "
                 "from project_rater pr "
                 "join app_user u on u.id = pr.user_id "
                 "where pr.project_id = %s order by u.login_name",
                 (project["id"],),
             )
             raters = cur.fetchall()
-            # FIX507.2.3.1.12.1: <rating-user> is picked from users having
-            # admin or data-manager rights on this project -- global admins
-            # union this project's data managers (same is_data_manager flag
-            # FIX351.2.1.2 / list_projects already reads).
-            cur.execute(
-                "select id, login_name as name from app_user where is_admin "
-                "union "
-                "select u.id, u.login_name as name from app_user u "
-                "join project_access pa on pa.user_id = u.id "
-                "where pa.project_id = %s and pa.is_data_manager "
-                "order by name",
-                (project["id"],),
-            )
-            rating_candidates = cur.fetchall()
             # FIX520.4.3: the displayed rating is ONLY the logged-in
             # caller's own -- never fetched/returned for anonymous
             # callers or for any other user.
@@ -3290,6 +3321,11 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # FIX404.1.1: gates the item deep-link (only public projects).
             "is_public": bool(project.get("is_public")),
             "is_admin_or_manager": is_admin_or_manager,
+            # FIX300.3.10.3.2 / FIX300.3.10.6.2 <role-layout-mngr> /
+            # <role-setup-mngr> — gate <button-item-grouping>/
+            # <button-columns> and <button-setup> respectively.
+            "is_layout_mngr": is_layout_mngr,
+            "is_setup_mngr": is_setup_mngr,
             # FIX352.2.6 / FIX503.3.5: surface the introduction so the
             # ShowcaseView About popup can render it. front_introduction
             # is intentionally NOT included here — it's a HomeView
@@ -3315,8 +3351,6 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "show_conflict": bool(project.get("show_rating_conflict")),
             "conflict_threshold": project.get("rating_conflict_threshold") or 2,
         },
-        # FIX507.2.3.1.12.1 <rating-user> picker source.
-        "rating_candidates": rating_candidates,
     }
 
 
@@ -3418,44 +3452,10 @@ def _save_setup_impl(payload):
                         (list(values_to_delete),),
                     )
 
-                # FIX507.2.3.1 <table-users-allowed-to-rate>.
-                incoming_raters = rating_payload.get("raters") or []
-                cur.execute(
-                    "select id from project_rater where project_id = %s",
-                    (project_id,),
-                )
-                existing_rater_ids = {r["id"] for r in cur.fetchall()}
-                incoming_rater_ids = {
-                    r["id"] for r in incoming_raters if isinstance(r.get("id"), int)
-                }
-                for r in incoming_raters:
-                    user_id = r.get("user_id")
-                    if not user_id:
-                        continue
-                    acronym = (r.get("acronym") or "").strip() or None
-                    # FIX507.4.4: Adding a user sets it enabled by default.
-                    enabled = bool(r.get("enabled", True))
-                    if isinstance(r.get("id"), int) and r["id"] in existing_rater_ids:
-                        cur.execute(
-                            "update project_rater set acronym = %s, enabled = %s "
-                            "where id = %s",
-                            (acronym, enabled, r["id"]),
-                        )
-                    else:
-                        cur.execute(
-                            "insert into project_rater "
-                            "(project_id, user_id, acronym, enabled) "
-                            "values (%s, %s, %s, %s) "
-                            "on conflict (project_id, user_id) do update "
-                            "set acronym = excluded.acronym, enabled = excluded.enabled",
-                            (project_id, user_id, acronym, enabled),
-                        )
-                raters_to_delete = existing_rater_ids - incoming_rater_ids
-                if raters_to_delete:
-                    cur.execute(
-                        "delete from project_rater where id = any(%s)",
-                        (list(raters_to_delete),),
-                    )
+                # FIX507.2.3(removed): raters are no longer saved from
+                # here -- <role-rater> (project_access.is_rater) is set
+                # via <panel-project> (FIX352.3.10.10 / FIX351.2.1.8)
+                # like every other role, and takes effect immediately.
 
                 # FIX373.5.1 (Topic 6, User's basket): a single grouping,
                 # named 'My basket', added/removed as field-enable-rating
@@ -3658,8 +3658,7 @@ def _save_setup_impl(payload):
             )
             fresh_rating_values = cur.fetchall()
             cur.execute(
-                "select pr.id, pr.user_id, u.login_name as name, "
-                "       pr.acronym, pr.enabled "
+                "select pr.id, pr.user_id, u.login_name as name "
                 "from project_rater pr "
                 "join app_user u on u.id = pr.user_id "
                 "where pr.project_id = %s order by u.login_name",
@@ -3714,12 +3713,12 @@ async def set_item_rating(
             if not row["enable_rating"]:
                 raise HTTPException(status_code=403, detail="rating is not enabled for this project")
             cur.execute(
-                "select 1 from project_rater "
-                "where project_id = %s and user_id = %s and enabled",
+                "select 1 from project_access "
+                "where project_id = %s and user_id = %s and is_rater",
                 (row["project_id"], user["id"]),
             )
             if not cur.fetchone():
-                raise HTTPException(status_code=403, detail="not an enabled rater on this project")
+                raise HTTPException(status_code=403, detail="not a rater on this project")
             if rating_value_id is None:
                 cur.execute(
                     "delete from item_rating where folder_id = %s and user_id = %s",
