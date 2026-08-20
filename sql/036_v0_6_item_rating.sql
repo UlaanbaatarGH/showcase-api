@@ -18,10 +18,8 @@ create table if not exists rating_value (
 create index if not exists rating_value_project_idx
   on rating_value(project_id, sort_order);
 
--- FIX507.4.3: a project_rater row is disabled (not deleted) when the
--- user loses project access or data-manager rights, so past rating
--- data tied to user_id survives until the row is explicitly removed
--- from <table-users-allowed-to-rate>.
+-- (FIX507.4.3, since removed -- see migration 043: role-rater replaced
+-- the disable/re-enable table this row modelled.)
 create table if not exists project_rater (
   id         serial primary key,
   project_id bigint not null references project(id) on delete cascade,
