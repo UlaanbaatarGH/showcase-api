@@ -436,6 +436,12 @@ async def upsert_me(request: Request, user=Depends(current_user_required)):
             row["managed_project_ids"] = _managed_project_ids(cur, user["id"])
             row["user_managed_project_ids"] = _user_managed_project_ids(cur, user["id"])
         conn.commit()
+    # FIX410.1.1.6.2: "no one can ... login, admin excepted". Reusing 401
+    # here (rather than 403) piggybacks on the existing stale-token
+    # recovery path both frontend call sites already have -- it clears
+    # the token and signs the user back out with no extra client code.
+    if not row["is_admin"] and _maintenance_enabled():
+        raise HTTPException(status_code=401, detail="site is in maintenance")
     return row
 
 
@@ -918,6 +924,42 @@ def _resolve_contact_to() -> Optional[str]:
     except Exception:
         traceback.print_exc()
     return CONTACT_TO_FALLBACK
+
+
+# FIX410.1.1.6 <website-In-maintenance>: site-wide maintenance flag,
+# stored the same way as contact_to (app_setting.maintenance_mode).
+def _maintenance_enabled() -> bool:
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select value from app_setting where key = 'maintenance_mode'"
+            )
+            row = cur.fetchone()
+    return bool(row and row["value"] == "true")
+
+
+@app.get("/api/app-status")
+def app_status():
+    """Public (no auth) -- the home page needs this before knowing
+    whether anyone is signed in, to show the FIX410.1.1.6.2 banner."""
+    return {"in_maintenance": _maintenance_enabled()}
+
+
+@app.patch("/api/admin/maintenance")
+async def set_maintenance(request: Request, _admin=Depends(current_admin_required)):
+    payload = await request.json()
+    value = payload.get("in_maintenance")
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail="in_maintenance must be a boolean")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "insert into app_setting (key, value) values ('maintenance_mode', %s) "
+                "on conflict (key) do update set value = excluded.value",
+                ("true" if value else "false",),
+            )
+        conn.commit()
+    return {"in_maintenance": value}
 
 
 def _resend_send(payload: dict, *, label: str) -> Optional[dict]:
@@ -3043,13 +3085,15 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # incorrectly showing <menu-admin> and the other FIX503.4.1
             # affordances to callers who aren't actually Data Managers.
             is_admin_or_manager = False
+            caller_is_admin = False
             if user is not None:
                 cur.execute(
                     "select is_admin from app_user where id = %s",
                     (user["id"],),
                 )
                 pr = cur.fetchone()
-                if pr and pr["is_admin"]:
+                caller_is_admin = bool(pr and pr["is_admin"])
+                if caller_is_admin:
                     is_admin_or_manager = True
                 else:
                     cur.execute(
@@ -3058,6 +3102,12 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                         (project["id"], user["id"]),
                     )
                     is_admin_or_manager = cur.fetchone() is not None
+            # FIX410.1.1.6.2: "no one can open any project ... admin
+            # excepted". Frontend already redirects away from the project
+            # route in this state; this is the API-level backstop for a
+            # direct call.
+            if not caller_is_admin and _maintenance_enabled():
+                raise HTTPException(status_code=503, detail="site is in maintenance")
             # FIX350.2.3.1: property list lives on Master Folder, not project.
             # A project can have several Master Folders (FIX350.2.3.3); we union
             # their properties here for the showcase view.
