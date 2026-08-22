@@ -4428,7 +4428,17 @@ async def replace_image_bytes(image_id: int, request: Request, user=Depends(curr
                 _bucket_delete(thumbnail_storage_key(old_key))
             except Exception:
                 pass
-        return {"storage_key": new_key, "url": public_image_url(new_key), "bytes": len(raw)}
+        # FIX521.5.9 (updated): the caller needs the freshly regenerated
+        # thumbnail too, not just the full-size url -- otherwise whichever
+        # row is currently the item's Gallery-panel thumbnail keeps
+        # pointing at the pre-edit thumbnail after a rotate/crop save or a
+        # Shrink, until the next full reload re-derives it server-side.
+        return {
+            "storage_key": new_key,
+            "url": public_image_url(new_key),
+            "thumb_url": thumbnail_url(new_key, thumb_created_at),
+            "bytes": len(raw),
+        }
     except HTTPException:
         raise
     except Exception as e:
