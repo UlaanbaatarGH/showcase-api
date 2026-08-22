@@ -3053,6 +3053,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 cur.execute(
                     "select p.id, p.name, p.is_public, p.view_setup, p.enable_rating, "
                     "       p.show_rating_conflict, p.rating_conflict_threshold, "
+                    "       p.rating_conflict_comparator, "
                     "       p.front_introduction, p.introduction, "
                     "       p.title_long_text, p.title_short_text, p.title_size, p.title_colour, p.title_is_bold "
                     "from project p "
@@ -3071,6 +3072,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                     cur.execute(
                         "select id, name, view_setup, enable_rating, "
                         "       show_rating_conflict, rating_conflict_threshold, "
+                        "       rating_conflict_comparator, "
                         "       front_introduction, introduction, "
                         "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                         "from project order by sort_order, id"
@@ -3086,6 +3088,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 cur.execute(
                     "select id, name, is_public, view_setup, enable_rating, "
                     "       show_rating_conflict, rating_conflict_threshold, "
+                    "       rating_conflict_comparator, "
                     "       front_introduction, introduction, "
                     "       title_long_text, title_short_text, title_size, title_colour, title_is_bold "
                     "from project "
@@ -3273,24 +3276,30 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             ratings_by_folder = {}
             for r in cur.fetchall():
                 ratings_by_folder.setdefault(r["folder_id"], {})[str(r["user_id"])] = r["rating_value_id"]
-            # FIX520.4.7 <item-with-conflicting-rating>: only computed
-            # when show_rating_conflict is on -- flags an item where two
-            # or more configured raters (any two, not just the caller)
-            # each rated it at or above the threshold rank
-            # (rating_value.sort_order).
+            # FIX520.4.7 <rating-conflict-detection>: only computed when
+            # show_rating_conflict is on -- flags an item where two or
+            # more configured raters (any two, not just the caller) each
+            # have a <rating-rank> (1-based -- rating_value.sort_order + 1,
+            # FIX507.2.2.1.3) that satisfies <rating-rank> {comparator}
+            # {threshold} (FIX507.2.6 / FIX507.2.5).
             conflict_folder_ids = set()
             if project.get("show_rating_conflict") and ratings_by_folder:
                 cur.execute(
                     "select id, sort_order from rating_value where project_id = %s",
                     (project["id"],),
                 )
-                sort_order_by_value_id = {r["id"]: r["sort_order"] for r in cur.fetchall()}
-                threshold = project.get("rating_conflict_threshold") or 2
+                rank_by_value_id = {r["id"]: r["sort_order"] + 1 for r in cur.fetchall()}
+                threshold = project.get("rating_conflict_threshold") or 3
+                comparator = project.get("rating_conflict_comparator") or '<'
+
+                def _is_high(rv_id):
+                    rank = rank_by_value_id.get(rv_id)
+                    if rank is None:
+                        return False
+                    return rank < threshold if comparator == '<' else rank > threshold
+
                 for folder_id, by_user in ratings_by_folder.items():
-                    high_count = sum(
-                        1 for rv_id in by_user.values()
-                        if sort_order_by_value_id.get(rv_id, -1) >= threshold
-                    )
+                    high_count = sum(1 for rv_id in by_user.values() if _is_high(rv_id))
                     if high_count >= 2:
                         conflict_folder_ids.add(folder_id)
     folders = [
@@ -3364,7 +3373,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "raters": raters,
             # FIX507.2.4 / FIX507.2.5.
             "show_conflict": bool(project.get("show_rating_conflict")),
-            "conflict_threshold": project.get("rating_conflict_threshold") or 2,
+            "conflict_threshold": project.get("rating_conflict_threshold") or 3,
+            # FIX507.2.6 <field-rating-conflict-comparator>.
+            "conflict_comparator": project.get("rating_conflict_comparator") or '<',
             # FIX507.2.2.1.14.1.
             "value_usage": rating_value_usage,
         },
@@ -3420,17 +3431,28 @@ def _save_setup_impl(payload):
                     "update project set enable_rating = %s where id = %s",
                     (bool(rating_payload.get("enabled")), project_id),
                 )
-                # FIX507.2.5.1: mandatory, defaulted to 2 -- an invalid or
+                # FIX507.2.5.1: mandatory, defaulted to 3 -- an invalid or
                 # missing value falls back to the default rather than
                 # blocking the whole save.
                 try:
                     conflict_threshold = int(rating_payload.get("conflict_threshold"))
                 except (TypeError, ValueError):
-                    conflict_threshold = 2
+                    conflict_threshold = 3
+                # FIX507.2.6: mandatory dropdown, defaulted to '<' -- any
+                # other incoming value falls back to the default too.
+                conflict_comparator = rating_payload.get("conflict_comparator")
+                if conflict_comparator not in ('<', '>'):
+                    conflict_comparator = '<'
                 cur.execute(
                     "update project set show_rating_conflict = %s, "
-                    "rating_conflict_threshold = %s where id = %s",
-                    (bool(rating_payload.get("show_conflict")), conflict_threshold, project_id),
+                    "rating_conflict_threshold = %s, "
+                    "rating_conflict_comparator = %s where id = %s",
+                    (
+                        bool(rating_payload.get("show_conflict")),
+                        conflict_threshold,
+                        conflict_comparator,
+                        project_id,
+                    ),
                 )
                 # FIX507.2.2.1 <table-rating-values>: same insert/update/
                 # delete-by-diff pattern as the property table above.
@@ -3663,7 +3685,8 @@ def _save_setup_impl(payload):
             fresh_properties = cur.fetchall()
 
             cur.execute(
-                "select enable_rating, show_rating_conflict, rating_conflict_threshold "
+                "select enable_rating, show_rating_conflict, rating_conflict_threshold, "
+                "       rating_conflict_comparator "
                 "from project where id = %s", (project_id,),
             )
             proj_row = cur.fetchone()
@@ -3703,7 +3726,8 @@ def _save_setup_impl(payload):
             "values": fresh_rating_values,
             "raters": fresh_raters,
             "show_conflict": bool(proj_row["show_rating_conflict"]),
-            "conflict_threshold": proj_row["rating_conflict_threshold"] or 2,
+            "conflict_threshold": proj_row["rating_conflict_threshold"] or 3,
+            "conflict_comparator": proj_row["rating_conflict_comparator"] or '<',
             "value_usage": fresh_rating_value_usage,
         },
     }
