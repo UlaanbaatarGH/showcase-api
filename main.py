@@ -3228,6 +3228,21 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 (project["id"],),
             )
             raters = cur.fetchall()
+            # FIX507.2.2.1.14.1: per rating-value usage breakdown, so
+            # <table-rating-values>'s delete-confirmation popup can list
+            # "{user} assigned this rating to {n} items." for every rating
+            # value that already has assignments.
+            cur.execute(
+                "select ir.rating_value_id, u.login_name as name, count(*) as count "
+                "from item_rating ir "
+                "join folder f on f.id = ir.folder_id "
+                "join app_user u on u.id = ir.user_id "
+                "where f.project_id = %s "
+                "group by ir.rating_value_id, u.login_name "
+                "order by ir.rating_value_id, u.login_name",
+                (project["id"],),
+            )
+            rating_value_usage = cur.fetchall()
             # FIX520.4.3: the displayed rating is ONLY the logged-in
             # caller's own -- never fetched/returned for anonymous
             # callers or for any other user.
@@ -3350,6 +3365,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             # FIX507.2.4 / FIX507.2.5.
             "show_conflict": bool(project.get("show_rating_conflict")),
             "conflict_threshold": project.get("rating_conflict_threshold") or 2,
+            # FIX507.2.2.1.14.1.
+            "value_usage": rating_value_usage,
         },
     }
 
@@ -3665,6 +3682,18 @@ def _save_setup_impl(payload):
                 (project_id,),
             )
             fresh_raters = cur.fetchall()
+            # FIX507.2.2.1.14.1: see the matching query in get_showcase.
+            cur.execute(
+                "select ir.rating_value_id, u.login_name as name, count(*) as count "
+                "from item_rating ir "
+                "join folder f on f.id = ir.folder_id "
+                "join app_user u on u.id = ir.user_id "
+                "where f.project_id = %s "
+                "group by ir.rating_value_id, u.login_name "
+                "order by ir.rating_value_id, u.login_name",
+                (project_id,),
+            )
+            fresh_rating_value_usage = cur.fetchall()
         conn.commit()
     return {
         "properties": fresh_properties,
@@ -3675,6 +3704,7 @@ def _save_setup_impl(payload):
             "raters": fresh_raters,
             "show_conflict": bool(proj_row["show_rating_conflict"]),
             "conflict_threshold": proj_row["rating_conflict_threshold"] or 2,
+            "value_usage": fresh_rating_value_usage,
         },
     }
 
