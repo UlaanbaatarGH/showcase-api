@@ -2720,6 +2720,28 @@ def _sync_project_rater_for_project(cur, project_id):
     )
 
 
+def _compute_conflict_folder_ids(ratings_by_folder, rank_by_value_id, threshold, comparator):
+    """FIX520.4.7 <rating-conflict-detection>: flags an item where two or
+    more raters (any two) each have a <rating-rank> (1-based --
+    rating_value.sort_order + 1, FIX507.2.2.1.3) that satisfies
+    <rating-rank> {comparator} {threshold} (FIX507.2.6 / FIX507.2.5).
+    Pure function over already-fetched data so both get_showcase (per
+    request) and _save_setup_impl's FIX507.4.6 reassessment (on every
+    Rating-tab save) share the exact same counting logic."""
+    def _is_high(rv_id):
+        rank = rank_by_value_id.get(rv_id)
+        if rank is None:
+            return False
+        return rank < threshold if comparator == '<' else rank > threshold
+
+    conflict_folder_ids = set()
+    for folder_id, by_user in ratings_by_folder.items():
+        high_count = sum(1 for rv_id in by_user.values() if _is_high(rv_id))
+        if high_count >= 2:
+            conflict_folder_ids.add(folder_id)
+    return conflict_folder_ids
+
+
 @app.post("/api/admin/users/{user_id}/projects/{project_id}")
 def grant_user_project(
     user_id: str,
@@ -3282,11 +3304,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             for r in cur.fetchall():
                 ratings_by_folder.setdefault(r["folder_id"], {})[str(r["user_id"])] = r["rating_value_id"]
             # FIX520.4.7 <rating-conflict-detection>: only computed when
-            # show_rating_conflict is on -- flags an item where two or
-            # more configured raters (any two, not just the caller) each
-            # have a <rating-rank> (1-based -- rating_value.sort_order + 1,
-            # FIX507.2.2.1.3) that satisfies <rating-rank> {comparator}
-            # {threshold} (FIX507.2.6 / FIX507.2.5).
+            # show_rating_conflict is on.
             conflict_folder_ids = set()
             if project.get("show_rating_conflict") and ratings_by_folder:
                 cur.execute(
@@ -3296,17 +3314,9 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                 rank_by_value_id = {r["id"]: r["sort_order"] + 1 for r in cur.fetchall()}
                 threshold = project.get("rating_conflict_threshold") or 3
                 comparator = project.get("rating_conflict_comparator") or '<'
-
-                def _is_high(rv_id):
-                    rank = rank_by_value_id.get(rv_id)
-                    if rank is None:
-                        return False
-                    return rank < threshold if comparator == '<' else rank > threshold
-
-                for folder_id, by_user in ratings_by_folder.items():
-                    high_count = sum(1 for rv_id in by_user.values() if _is_high(rv_id))
-                    if high_count >= 2:
-                        conflict_folder_ids.add(folder_id)
+                conflict_folder_ids = _compute_conflict_folder_ids(
+                    ratings_by_folder, rank_by_value_id, threshold, comparator,
+                )
     folders = [
         {
             "id": r["id"],
@@ -3431,6 +3441,10 @@ def _save_setup_impl(payload):
             # Callers that don't touch the Rating tab omit "rating"
             # entirely, leaving the existing DB state untouched.
             rating_payload = payload.get("rating")
+            # FIX507.4.6: None when the Rating tab wasn't touched at all --
+            # distinct from an empty list, so the caller can tell "nothing
+            # to reassess" from "reassessed, nothing conflicts".
+            conflicting_folder_ids = None
             if rating_payload is not None:
                 cur.execute(
                     "update project set enable_rating = %s where id = %s",
@@ -3495,6 +3509,35 @@ def _save_setup_impl(payload):
                         "delete from rating_value where id = any(%s)",
                         (list(values_to_delete),),
                     )
+
+                # FIX507.4.6: changing <table-rating-values>,
+                # <field-rating-conflict-threshold>, or
+                # <field-rating-conflict-comparator> can change which
+                # items conflict -- reassess every item now (deleting a
+                # value above already cascades to remove its item_rating
+                # rows, so this reads post-delete state) instead of
+                # leaving stale has_rating_conflict flags until the next
+                # full reload.
+                cur.execute(
+                    "select ir.folder_id, ir.user_id, ir.rating_value_id "
+                    "from item_rating ir join folder f on f.id = ir.folder_id "
+                    "where f.project_id = %s",
+                    (project_id,),
+                )
+                save_ratings_by_folder = {}
+                for r in cur.fetchall():
+                    save_ratings_by_folder.setdefault(r["folder_id"], {})[str(r["user_id"])] = r["rating_value_id"]
+                conflicting_folder_ids = []
+                if bool(rating_payload.get("show_conflict")) and save_ratings_by_folder:
+                    cur.execute(
+                        "select id, sort_order from rating_value where project_id = %s",
+                        (project_id,),
+                    )
+                    save_rank_by_value_id = {r["id"]: r["sort_order"] + 1 for r in cur.fetchall()}
+                    conflicting_folder_ids = sorted(_compute_conflict_folder_ids(
+                        save_ratings_by_folder, save_rank_by_value_id,
+                        conflict_threshold, conflict_comparator,
+                    ))
 
                 # FIX507.2.3(removed): raters are no longer saved from
                 # here -- <role-rater> (project_access.is_rater) is set
@@ -3736,6 +3779,11 @@ def _save_setup_impl(payload):
             "conflict_comparator": proj_row["rating_conflict_comparator"] or '<',
             "value_usage": fresh_rating_value_usage,
         },
+        # FIX507.4.6: None when the Rating tab wasn't touched (nothing to
+        # reassess); otherwise every folder_id that now conflicts, so the
+        # caller can update has_rating_conflict for the whole project
+        # without a full reload.
+        "conflicting_folder_ids": conflicting_folder_ids,
     }
 
 
