@@ -3212,8 +3212,13 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             )
             rows = cur.fetchall()
             # FIX507.2.2.1 <table-rating-values>: text + icon rows.
+            # Bug fix: sort_order was never actually sent to the client
+            # (only used server-side for the ORDER BY) -- every client-side
+            # use of rv.sort_order (rating-conflict-detection's rank math,
+            # FIX511.4.3's gallery-strip-by-rank sort, the my_rating
+            # column's sort value) silently computed NaN/undefined forever.
             cur.execute(
-                "select id, text, icon from rating_value "
+                "select id, text, icon, sort_order from rating_value "
                 "where project_id = %s order by sort_order, id",
                 (project["id"],),
             )
@@ -3691,8 +3696,9 @@ def _save_setup_impl(payload):
             )
             proj_row = cur.fetchone()
             enable_rating = bool(proj_row["enable_rating"])
+            # Bug fix: same missing sort_order as get_showcase's own query.
             cur.execute(
-                "select id, text, icon from rating_value "
+                "select id, text, icon, sort_order from rating_value "
                 "where project_id = %s order by sort_order, id",
                 (project_id,),
             )
