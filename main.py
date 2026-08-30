@@ -3397,6 +3397,34 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
     }
 
 
+# Bug fix (property_pkey collision, reported live on project 'Livres
+# anciens' / id 1: UniqueViolation, Key (id)=(26) already exists).
+# property.id is a single GLOBAL primary key, but the project-local id
+# allocation (FIX350.2.2.2.1.1's project_id*1000+N scheme, so id % 1000
+# shows a clean small display number) only stays collision-free for a
+# project actually migrated into that band. Several early projects
+# (this one included) still carry small legacy ids (11, 12, ... 25)
+# predating the scheme -- a project-scoped max+1 there can land on a
+# number some OTHER project already owns globally, which is exactly what
+# happened (both independently computed 26). Falling back to the true
+# global max+1 whenever it's higher than the project-scoped candidate
+# keeps the pretty per-project numbering for every project already living
+# in its own 1000+N band (its own max already IS the global high-water
+# mark there) while guaranteeing no collision for a legacy project, at
+# the cost of its next id occasionally jumping out of that project's
+# usual-looking range.
+def _next_property_id(cur, project_id):
+    cur.execute(
+        "select "
+        "  coalesce((select max(p.id) from property p join folder f on f.id = p.master_folder_id "
+        "            where f.project_id = %s), %s * 1000) as project_scoped, "
+        "  coalesce((select max(id) from property), 0) as global_max",
+        (project_id, project_id),
+    )
+    row = cur.fetchone()
+    return max(row["project_scoped"], row["global_max"]) + 1
+
+
 @app.post("/api/setup")
 async def save_setup(request: Request):
     payload = await request.json()
@@ -3661,17 +3689,9 @@ def _save_setup_impl(payload):
                     )
                 else:
                     # FIX350.2.2.2.1.1 / .1.1.1: allocate a project-local
-                    # id of the form project_id*1000 + N. We pick the
-                    # next slot above the project's current max so the
-                    # displayed id (= id mod 1000) keeps climbing.
-                    cur.execute(
-                        "select coalesce(max(p.id), %s * 1000) + 1 as next_id "
-                        "from property p "
-                        "join folder f on f.id = p.master_folder_id "
-                        "where f.project_id = %s",
-                        (project_id, project_id),
-                    )
-                    next_id = cur.fetchone()["next_id"]
+                    # id of the form project_id*1000 + N (see
+                    # _next_property_id for the global-collision fallback).
+                    next_id = _next_property_id(cur, project_id)
                     cur.execute(
                         "insert into property "
                         "  (id, master_folder_id, label, short_label, formula, "
@@ -3944,15 +3964,8 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_
                 if not label:
                     continue
                 # FIX350.2.2.2.1.1 / .1.1.1: project-local id allocation
-                # (see /api/setup for the rationale).
-                cur.execute(
-                    "select coalesce(max(p.id), %s * 1000) + 1 as next_id "
-                    "from property p "
-                    "join folder f on f.id = p.master_folder_id "
-                    "where f.project_id = %s",
-                    (project_id, project_id),
-                )
-                next_id = cur.fetchone()["next_id"]
+                # (see _next_property_id for the global-collision fallback).
+                next_id = _next_property_id(cur, project_id)
                 cur.execute(
                     "insert into property (id, master_folder_id, label, short_label, sort_order) "
                     "values (%s, %s, %s, %s, %s) returning id",
