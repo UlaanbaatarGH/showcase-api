@@ -4085,9 +4085,24 @@ def _apply_gsheet_plan(project_id, new_properties, renames, new_folders, folder_
                 next_fsort += 1
 
             # 4) lookup tables for updates
+            # Bug fix (user-reported: {#} caption placeholder never got a
+            # value even after a clean re-import that showed it as read).
+            # FIX350.2.3.3: a project can have SEVERAL Master Folders, but
+            # this used to only look up properties under the ONE master
+            # (order by id limit 1, same as master_folder_id above) chosen
+            # for creating brand-new properties/folders in this same
+            # request. A property living under a different master folder
+            # (e.g. setup-item-key-property, added separately from Setup)
+            # then never matched here -- every update for it was silently
+            # skipped (see skipped_prop below), with nothing surfaced to
+            # the caller. /api/showcase's own property list (the read side)
+            # already unions all master folders for the project; match that
+            # here too instead of the single arbitrarily-picked one.
             cur.execute(
-                "select id, label from property where master_folder_id = %s",
-                (master_folder_id,),
+                "select p.id, p.label from property p "
+                "join folder f on f.id = p.master_folder_id "
+                "where f.project_id = %s and f.is_master",
+                (project_id,),
             )
             property_rows = cur.fetchall()
             label_to_prop = {r["label"]: r["id"] for r in property_rows}
