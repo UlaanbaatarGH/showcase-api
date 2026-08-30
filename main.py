@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Optional
 import urllib.request
 import urllib.error
+import urllib.parse
 import boto3
 from botocore.config import Config
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -827,6 +828,65 @@ def _supabase_admin_delete_user(user_id: str) -> None:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
 
 
+# Bugfix (2026-08-23): a redemption/signup attempt can leave an orphaned
+# Supabase auth.users row behind if the create call above succeeds but
+# the local app_user update that follows it never commits (dropped
+# connection, request cancelled, etc). A retry then hits email_exists
+# on the *same* synthetic email even though nothing in Postgres was
+# ever linked to it. These two helpers let the caller adopt that
+# leftover row (reset its password, reuse its id) instead of getting
+# stuck in a permanent email_exists loop.
+def _supabase_admin_find_user_by_email(email: str) -> Optional[dict]:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="auth not configured")
+    qs = urllib.parse.urlencode({"filter": email})
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/admin/users?{qs}",
+        method="GET",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=400, detail=f"Supabase: {msg[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+    users = data.get("users") if isinstance(data, dict) else data
+    for u in users or []:
+        if (u.get("email") or "").lower() == email.lower():
+            return u
+    return None
+
+
+def _supabase_admin_set_password(user_id: str, password: str) -> None:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="auth not configured")
+    body = json.dumps({"password": password}).encode()
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+        data=body,
+        method="PUT",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=400, detail=f"Supabase: {msg[:200]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # FIX378.3.4.2: same sheet-id extraction as the frontend's
@@ -1281,7 +1341,22 @@ async def redeem_account(request: Request):
             # the Email column on the Users panel is administrative
             # metadata, not the auth identifier.
             synthetic_email = f"{name.lower()}@showcase.app"
-            new_auth = _supabase_admin_create_user(synthetic_email, password)
+            try:
+                new_auth = _supabase_admin_create_user(synthetic_email, password)
+            except HTTPException as create_err:
+                # Bugfix (2026-08-23): the synthetic email is unique to
+                # this login name, so email_exists here can only mean a
+                # previous redemption attempt already created this auth
+                # row but the app_user update below never ran (see the
+                # helpers' docstring above). Adopt the leftover row
+                # instead of failing forever.
+                if "email_exists" not in (create_err.detail or ""):
+                    raise
+                existing = _supabase_admin_find_user_by_email(synthetic_email)
+                if not existing:
+                    raise
+                _supabase_admin_set_password(existing["id"], password)
+                new_auth = existing
             new_id = new_auth.get("id")
             if not new_id:
                 raise HTTPException(
