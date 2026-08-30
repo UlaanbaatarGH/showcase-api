@@ -3273,6 +3273,7 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
                   f.sort_order,
                   f.properties,
                   f.zoom_factor,
+                  f.is_flagged,
                   img.storage_key as main_storage_key,
                   img.rotation    as main_rotation,
                   img.thumb_created_at as main_thumb_created_at,
@@ -3399,6 +3400,8 @@ def showcase(slug: Optional[str] = None, user=Depends(current_user_optional)):
             "note": r["note"],
             "sort_order": r["sort_order"],
             "properties": r["properties"] or {},
+            # FIX525.3.5 <action-item-flagging>.
+            "is_flagged": bool(r["is_flagged"]),
             "main_image_url": (
                 public_image_url(r["main_storage_key"], r["main_created_at"])
                 if r["main_storage_key"] else None
@@ -3943,6 +3946,50 @@ async def set_item_rating(
                 )
         conn.commit()
     return {"folder_id": folder_id, "rating_value_id": rating_value_id}
+
+
+@app.post("/api/folders/{folder_id}/flag")
+async def set_item_flag(
+    folder_id: int,
+    request: Request,
+    user=Depends(current_user_required),
+):
+    """FIX525.3.5 / <action-item-flagging>: sets or clears the small red
+    'needs fixing' flag on an item. FIX525.3.5.2: only an Admin or a project
+    Data Manager (<project-data-mngrs>) may do this -- same admin-exempt
+    is_data_manager check /api/showcase uses to compute is_admin_or_manager.
+    Visible to any viewer once set; only the write is gated."""
+    payload = await request.json()
+    flagged = bool(payload.get("flagged"))
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select project_id from folder where id = %s",
+                (folder_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="item not found")
+            cur.execute(
+                "select is_admin from app_user where id = %s",
+                (user["id"],),
+            )
+            pr = cur.fetchone()
+            caller_is_admin = bool(pr and pr["is_admin"])
+            if not caller_is_admin:
+                cur.execute(
+                    "select 1 from project_access "
+                    "where project_id = %s and user_id = %s and is_data_manager",
+                    (row["project_id"], user["id"]),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(status_code=403, detail="not a data manager on this project")
+            cur.execute(
+                "update folder set is_flagged = %s where id = %s",
+                (flagged, folder_id),
+            )
+        conn.commit()
+    return {"folder_id": folder_id, "is_flagged": flagged}
 
 
 # ============================================================
