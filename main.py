@@ -42,6 +42,10 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # required for authenti
 LOCAL_APP = os.environ.get("LOCAL_APP") == "1"
 LOCAL_APP_USER_ID = "cff25e93-75f6-4dc7-950a-7a53ddd7d813"  # Herve, app_user.is_admin=true
 
+# FIX405.4.2 <sign-in-possible-attempts>: consecutive failed sign-ins
+# allowed before <user-is-locked-out> (FIX310.12) flips true.
+SIGN_IN_POSSIBLE_ATTEMPTS = 3
+
 # Cloudflare R2 (S3-compatible) — image object storage. The database and auth
 # stay in Supabase; only image FILES live in R2. Public reads come from
 # R2_PUBLIC_BASE (the bucket's r2.dev URL or a custom domain).
@@ -414,7 +418,10 @@ def current_admin_required(request: Request) -> dict:
 
 
 # ============================================================
-# FIX310: users
+# FIX310[deep-updated from FIX310(deep-old)]: users, id <record-user>.
+# Fields: <user-username> (.1), <user-password> (.2), <user-access-code>
+# (.3), <user-email> (.4), <user-is-admin> (.10), the per-project access
+# list (.11), <user-is-locked-out> (.12, FIX405.4's lockout flag).
 # ============================================================
 @app.post("/api/users/me")
 async def upsert_me(request: Request, user=Depends(current_user_required)):
@@ -544,9 +551,13 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
     # the soft 30s dedup on (ip, page, user_id, project_id) so a
     # refresh / React StrictMode double-mount doesn't double-log, but
     # a sign-in inside the same window still produces a fresh row.
+    # FIX405.4: 'login_failed' / 'login_ok' also drive the per-user
+    # lockout counter (FIX310.12 <user-is-locked-out>) so the frontend
+    # can render FIX405.4.1.1 / .4.1.2's messages off this same call.
+    lockout = None
     try:
         with pool.connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 if page.startswith("login"):
                     cur.execute(
                         "insert into visit (user_id, ip, page, typed_login) "
@@ -567,10 +578,45 @@ async def track_visit(request: Request, user=Depends(current_user_optional)):
                         ")",
                         (user_id, ip, page, project_id, ip, page, user_id, project_id),
                     )
+                if page == "login_failed" and typed_login:
+                    cur.execute(
+                        "update app_user set failed_signin_attempts = failed_signin_attempts + 1 "
+                        "where lower(login_name) = lower(%s) "
+                        "returning failed_signin_attempts",
+                        (typed_login,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        attempts = row["failed_signin_attempts"]
+                        locked_out = attempts >= SIGN_IN_POSSIBLE_ATTEMPTS
+                        if locked_out:
+                            cur.execute(
+                                "update app_user set is_locked_out = true "
+                                "where lower(login_name) = lower(%s)",
+                                (typed_login,),
+                            )
+                        lockout = {
+                            "locked_out": locked_out,
+                            "attempts_remaining": max(SIGN_IN_POSSIBLE_ATTEMPTS - attempts, 0),
+                        }
+                    else:
+                        # FIX405.4.1.1: unknown login name — nothing to
+                        # persist, but answer with the same shape a
+                        # fresh real account would get so this can't be
+                        # used to tell a typo from a real name.
+                        lockout = {
+                            "locked_out": False,
+                            "attempts_remaining": SIGN_IN_POSSIBLE_ATTEMPTS - 1,
+                        }
+                elif page == "login_ok" and user_id:
+                    cur.execute(
+                        "update app_user set failed_signin_attempts = 0 where id = %s",
+                        (user_id,),
+                    )
             conn.commit()
     except Exception:
         traceback.print_exc()
-    return {"ok": True}
+    return {"ok": True, **({"lockout": lockout} if lockout is not None else {})}
 
 
 @app.get("/api/admin/visits")
@@ -668,6 +714,9 @@ def _user_row_to_dict(row, projects, see_sensitive=True):
         "access_code": row["access_code"] if see_sensitive else None,
         "is_admin": bool(row["is_admin"]),
         "has_password": bool(row.get("has_password")),
+        # FIX310.12 / FIX311.2.1.7 <user-is-locked-out>: not gated by
+        # FIX311.5.9 — unlike email/access-code it isn't listed there.
+        "is_locked_out": bool(row.get("is_locked_out")),
         "projects": projects,
     }
 
@@ -697,6 +746,7 @@ def list_users(user=Depends(current_user_required)):
             # unchecked until they redeem their access code.
             cur.execute(
                 "select u.id, u.login_name, u.email, u.access_code, u.is_admin, "
+                "       u.is_locked_out, "
                 "       (au.encrypted_password is not null) as has_password "
                 "from app_user u "
                 "left join auth.users au on au.id = u.id "
@@ -1285,11 +1335,11 @@ def _send_contact_email(
 
 @app.post("/api/auth/redeem")
 async def redeem_account(request: Request):
-    """FIX317 (Manager flow): redeem an access code to set the user's
-    password and email. Body: { name, access_code, password, email }.
-    Caller is anonymous — after success the frontend calls
-    supabase.auth.signInWithPassword with the same name + password to
-    obtain a session."""
+    """FIX317 (Manager flow) / FIX406: redeem an access code to set the
+    user's password (and email, FIX406.2.5). Body: { name, access_code,
+    password, email }. Caller is anonymous — after success the frontend
+    calls supabase.auth.signInWithPassword with the same name + password
+    to obtain a session."""
     payload = await request.json() if await request.body() else {}
     name = (payload.get("name") or "").strip()
     code = (payload.get("access_code") or "").strip()
@@ -1306,13 +1356,15 @@ async def redeem_account(request: Request):
             status_code=400,
             detail="password must be at least 8 characters",
         )
-    # FIX317.3.1.4: email shape check.
-    if not email or not _EMAIL_RE.match(email):
+    # FIX406.2.5: only shape-check email when one was actually sent —
+    # it's optional here when <record-user> already has one (checked
+    # against the row below).
+    if email and not _EMAIL_RE.match(email):
         raise HTTPException(status_code=400, detail="email is not valid")
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "select u.id, u.login_name, u.access_code, "
+                "select u.id, u.login_name, u.access_code, u.email, "
                 "       (au.encrypted_password is not null) as has_password "
                 "from app_user u "
                 "left join auth.users au on au.id = u.id "
@@ -1331,6 +1383,12 @@ async def redeem_account(request: Request):
                 raise invalid
             if row["access_code"] != code:
                 raise invalid
+            # FIX406.2.5: mandatory only when the record doesn't have
+            # one yet — checked here (after the invalid-credential
+            # checks above) so it never becomes an enumeration signal.
+            if not row["email"] and not email:
+                raise HTTPException(status_code=400, detail="email is not valid")
+            final_email = email or row["email"]
 
             # Login flow stays login_name → <name>@showcase.app, so
             # use the synthetic email here too. Lowercased to match the
@@ -1370,10 +1428,51 @@ async def redeem_account(request: Request):
             cur.execute(
                 "update app_user set id = %s, email = %s, access_code = null "
                 "where id = %s",
-                (new_id, email, row["id"]),
+                (new_id, final_email, row["id"]),
             )
         conn.commit()
     return {"ok": True}
+
+
+@app.get("/api/auth/signin-status")
+def signin_status(name: str = ""):
+    """FIX405.3.1 <process-sign-in> pre-check: is this login name
+    currently locked out (FIX310.12 <user-is-locked-out>)? Anonymous —
+    called before the frontend even attempts the Supabase credential
+    check, so a locked account never reaches it. An unknown name reads
+    as not-locked, same as a fresh account."""
+    name = name.strip()
+    locked_out = False
+    if name:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "select is_locked_out from app_user where lower(login_name) = lower(%s)",
+                    (name,),
+                )
+                row = cur.fetchone()
+                locked_out = bool(row and row["is_locked_out"])
+    return {"locked_out": locked_out}
+
+
+@app.get("/api/auth/user-has-email")
+def user_has_email(name: str = ""):
+    """FIX406.2.5: does <record-user> for this login name already have
+    an email on file? Drives whether <panel-sign-in-with access-code>
+    shows its Email field. Only reveals a yes/no on that one fact — an
+    unknown name and a known-but-emailless one both answer False."""
+    name = name.strip()
+    has_email = False
+    if name:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "select email from app_user where lower(login_name) = lower(%s)",
+                    (name,),
+                )
+                row = cur.fetchone()
+                has_email = bool(row and row["email"])
+    return {"has_email": has_email}
 
 
 @app.post("/api/auth/signup-visitor")
@@ -2732,8 +2831,10 @@ def reset_user_password(user_id: str, _admin=Depends(current_admin_required)):
     """FIX318 <process-reset-pswd>: triggered by <btn-reset-pswd>
     (FIX312.3.1). Same principle as user creation (FIX318.1 /
     FIX311.3.1.1.3): issue a fresh access code and clear the existing
-    password so the user redeems again via <panel-create-account>
-    (FIX317) at next login."""
+    password so the user redeems again via <panel-sign-in-with
+    access-code> (FIX406) at next login. FIX405.4.1.2 points a
+    locked-out user at exactly this action, so it's also the one place
+    <user-is-locked-out> gets cleared (nothing else does)."""
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select 1 from app_user where id = %s", (user_id,))
@@ -2742,7 +2843,9 @@ def reset_user_password(user_id: str, _admin=Depends(current_admin_required)):
             # FIX318.2.1: fresh 6-digit code, same generation as FIX311.3.1.1.3.
             access_code = f"{secrets.randbelow(1000000):06d}"
             cur.execute(
-                "update app_user set access_code = %s where id = %s",
+                "update app_user set access_code = %s, "
+                "       failed_signin_attempts = 0, is_locked_out = false "
+                "where id = %s",
                 (access_code, user_id),
             )
         conn.commit()

@@ -28,7 +28,7 @@ alter table project
 
 
 -- ============================================================
--- FIX310.1.4: per-user per-project access rights
+-- FIX310.11[ex-310.1.4]: per-user per-project access rights
 -- ============================================================
 -- Rights stored as a subset of 'CRUD' letters (e.g. '', 'R', 'CRU', 'CRUD').
 -- group2 maps to FIX350.10.1.2 actions, group3 to FIX350.10.1.3 actions.
