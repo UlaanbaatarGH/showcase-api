@@ -2679,6 +2679,162 @@ def delete_language(code: str, _admin=Depends(current_admin_required)):
     return {"ok": True}
 
 
+# ============================================================
+# FIX415 <panel-shared-data>: admin-managed global properties, each
+# with a list of values (table shared_property / shared_property_value,
+# migration 049). FIX415.1: property names unique, values unique
+# within a property — both case-insensitive, enforced here (409) and
+# by unique indexes.
+# ============================================================
+def _shared_text(payload: dict, key: str) -> str:
+    text = (payload.get(key) or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{key} required")
+    return text
+
+
+def _shared_list(cur) -> list:
+    cur.execute("select id, name from shared_property order by sort_order, id")
+    props = [{"id": r["id"], "name": r["name"], "values": []} for r in cur.fetchall()]
+    by_id = {p["id"]: p for p in props}
+    cur.execute(
+        "select id, property_id, value from shared_property_value "
+        "order by sort_order, id"
+    )
+    for r in cur.fetchall():
+        p = by_id.get(r["property_id"])
+        if p is not None:
+            p["values"].append({"id": r["id"], "value": r["value"]})
+    return props
+
+
+def _shared_name_taken(cur, name: str, exclude_id=None) -> bool:
+    cur.execute(
+        "select 1 from shared_property where lower(name) = lower(%s) "
+        "and id is distinct from %s",
+        (name, exclude_id),
+    )
+    return cur.fetchone() is not None
+
+
+def _shared_value_taken(cur, property_id: int, value: str, exclude_id=None) -> bool:
+    cur.execute(
+        "select 1 from shared_property_value where property_id = %s "
+        "and lower(value) = lower(%s) and id is distinct from %s",
+        (property_id, value, exclude_id),
+    )
+    return cur.fetchone() is not None
+
+
+@app.get("/api/admin/shared-data")
+def list_shared_data(_admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            return _shared_list(cur)
+
+
+@app.post("/api/admin/shared-data/properties")
+async def create_shared_property(request: Request, _admin=Depends(current_admin_required)):
+    payload = await request.json() if await request.body() else {}
+    name = _shared_text(payload, "name")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if _shared_name_taken(cur, name):
+                raise HTTPException(status_code=409, detail="property name already exists")
+            cur.execute(
+                "insert into shared_property (name, sort_order) values "
+                "(%s, (select coalesce(max(sort_order), -1) + 1 from shared_property)) "
+                "returning id",
+                (name,),
+            )
+            new_id = cur.fetchone()["id"]
+            conn.commit()
+            return {"id": new_id, "items": _shared_list(cur)}
+
+
+@app.patch("/api/admin/shared-data/properties/{prop_id}")
+async def rename_shared_property(
+    prop_id: int, request: Request, _admin=Depends(current_admin_required)
+):
+    payload = await request.json() if await request.body() else {}
+    name = _shared_text(payload, "name")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from shared_property where id = %s", (prop_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="property not found")
+            if _shared_name_taken(cur, name, prop_id):
+                raise HTTPException(status_code=409, detail="property name already exists")
+            cur.execute("update shared_property set name = %s where id = %s", (name, prop_id))
+            conn.commit()
+            return {"items": _shared_list(cur)}
+
+
+@app.delete("/api/admin/shared-data/properties/{prop_id}")
+def delete_shared_property(prop_id: int, _admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # Values go with it (on delete cascade).
+            cur.execute("delete from shared_property where id = %s", (prop_id,))
+            conn.commit()
+            return {"items": _shared_list(cur)}
+
+
+@app.post("/api/admin/shared-data/properties/{prop_id}/values")
+async def create_shared_value(
+    prop_id: int, request: Request, _admin=Depends(current_admin_required)
+):
+    payload = await request.json() if await request.body() else {}
+    value = _shared_text(payload, "value")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select 1 from shared_property where id = %s", (prop_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="property not found")
+            if _shared_value_taken(cur, prop_id, value):
+                raise HTTPException(status_code=409, detail="value already exists in this property")
+            cur.execute(
+                "insert into shared_property_value (property_id, value, sort_order) values "
+                "(%s, %s, (select coalesce(max(sort_order), -1) + 1 "
+                "from shared_property_value where property_id = %s))",
+                (prop_id, value, prop_id),
+            )
+            conn.commit()
+            return {"items": _shared_list(cur)}
+
+
+@app.patch("/api/admin/shared-data/values/{value_id}")
+async def update_shared_value(
+    value_id: int, request: Request, _admin=Depends(current_admin_required)
+):
+    payload = await request.json() if await request.body() else {}
+    value = _shared_text(payload, "value")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select property_id from shared_property_value where id = %s", (value_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="value not found")
+            if _shared_value_taken(cur, row["property_id"], value, value_id):
+                raise HTTPException(status_code=409, detail="value already exists in this property")
+            cur.execute(
+                "update shared_property_value set value = %s where id = %s", (value, value_id)
+            )
+            conn.commit()
+            return {"items": _shared_list(cur)}
+
+
+@app.delete("/api/admin/shared-data/values/{value_id}")
+def delete_shared_value(value_id: int, _admin=Depends(current_admin_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("delete from shared_property_value where id = %s", (value_id,))
+            conn.commit()
+            return {"items": _shared_list(cur)}
+
+
 @app.post("/api/admin/projects/{project_id}/move")
 async def move_admin_project(
     project_id: int,
