@@ -2771,14 +2771,18 @@ def _shared_value_taken(cur, property_id: int, value: str, exclude_id=None) -> b
     return cur.fetchone() is not None
 
 
-# FIX352.2.14: names only, for the <project-shared-data> selector —
-# open to any signed-in user since project editors need not be admin.
+# FIX352.2.14 / FIX370.2.1.9: shared properties with their values, for
+# the <project-shared-data> selector and the gsheet import value check —
+# open to any signed-in user since project editors / importers need not
+# be admin.
 @app.get("/api/shared-data/properties")
 def list_shared_properties(_user=Depends(current_user_required)):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select id, name from shared_property order by sort_order, id")
-            return [{"id": r["id"], "name": r["name"]} for r in cur.fetchall()]
+            return [
+                {"id": p["id"], "name": p["name"], "values": [v["value"] for v in p["values"]]}
+                for p in _shared_list(cur)
+            ]
 
 
 @app.get("/api/admin/shared-data")
