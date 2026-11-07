@@ -1933,8 +1933,6 @@ def list_admin_projects(user=Depends(current_user_required)):
             )
             slug_rows = cur.fetchall()
             # FIX352.2.14 <project-shared-data>: shared data in use.
-            # FIX415.4.1: linked by id and joined for the live name, so a
-            # shared property rename shows up in every project at once.
             cur.execute(
                 "select psd.project_id, psd.kind, sp.id, sp.name "
                 "from project_shared_data psd "
@@ -2777,13 +2775,26 @@ def _shared_value_taken(cur, property_id: int, value: str, exclude_id=None) -> b
 # the <project-shared-data> selector and the gsheet import value check —
 # open to any signed-in user since project editors / importers need not
 # be admin.
+# FIX415.4.1: with ?project_id=, only the shared properties that project
+# has accepted under <project-shared-data> — the gate for processing a
+# project's data as shared (Setup link FIX506.5.6, import FIX370.2.1.9).
 @app.get("/api/shared-data/properties")
-def list_shared_properties(_user=Depends(current_user_required)):
+def list_shared_properties(
+    project_id: Optional[int] = None, _user=Depends(current_user_required),
+):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            props = _shared_list(cur)
+            if project_id is not None:
+                cur.execute(
+                    "select property_id from project_shared_data where project_id = %s",
+                    (project_id,),
+                )
+                accepted = {r["property_id"] for r in cur.fetchall()}
+                props = [p for p in props if p["id"] in accepted]
             return [
                 {"id": p["id"], "name": p["name"], "values": [v["value"] for v in p["values"]]}
-                for p in _shared_list(cur)
+                for p in props
             ]
 
 
@@ -2821,12 +2832,21 @@ async def rename_shared_property(
     name = _shared_text(payload, "name")
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select 1 from shared_property where id = %s", (prop_id,))
-            if not cur.fetchone():
+            cur.execute("select name from shared_property where id = %s", (prop_id,))
+            row = cur.fetchone()
+            if not row:
                 raise HTTPException(status_code=404, detail="property not found")
             if _shared_name_taken(cur, name, prop_id):
                 raise HTTPException(status_code=409, detail="property name already exists")
             cur.execute("update shared_property set name = %s where id = %s", (name, prop_id))
+            # FIX415.4.1: a rename withdraws every project's acceptance —
+            # their old-name property becomes local again, and the new
+            # name has no effect until the project re-adds it under
+            # <project-shared-data>.
+            if row["name"] != name:
+                cur.execute(
+                    "delete from project_shared_data where property_id = %s", (prop_id,),
+                )
             conn.commit()
             return {"items": _shared_list(cur)}
 
