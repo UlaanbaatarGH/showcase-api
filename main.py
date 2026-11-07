@@ -1933,6 +1933,8 @@ def list_admin_projects(user=Depends(current_user_required)):
             )
             slug_rows = cur.fetchall()
             # FIX352.2.14 <project-shared-data>: shared data in use.
+            # FIX415.4.1: linked by id and joined for the live name, so a
+            # shared property rename shows up in every project at once.
             cur.execute(
                 "select psd.project_id, psd.kind, sp.id, sp.name "
                 "from project_shared_data psd "
