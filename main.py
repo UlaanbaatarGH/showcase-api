@@ -1932,6 +1932,18 @@ def list_admin_projects(user=Depends(current_user_required)):
                 "from project_slug order by project_id, sort_order, id"
             )
             slug_rows = cur.fetchall()
+            # FIX352.2.14 <project-shared-data>: shared data in use.
+            cur.execute(
+                "select psd.project_id, psd.kind, sp.id, sp.name "
+                "from project_shared_data psd "
+                "join shared_property sp on sp.id = psd.property_id "
+                "order by psd.project_id, psd.sort_order, sp.name"
+            )
+            shared_by_proj: dict[int, list] = {}
+            for r in cur.fetchall():
+                shared_by_proj.setdefault(r["project_id"], []).append(
+                    {"type": r["kind"], "id": r["id"], "label": r["name"]}
+                )
             slugs_by_proj: dict[int, list] = {}
             for s in slug_rows:
                 slugs_by_proj.setdefault(s["project_id"], []).append({
@@ -2001,6 +2013,7 @@ def list_admin_projects(user=Depends(current_user_required)):
             "front_introduction": p.get("front_introduction") or "",
             "introduction": p.get("introduction") or "",
             "slugs": slugs_by_proj.get(p["id"], []),
+            "shared_data": shared_by_proj.get(p["id"], []),
             # FIX352.2.7 <project-title>: optional decorative label
             # rendered in the project page header.
             "title_long_text": p.get("title_long_text") or "",
@@ -2115,6 +2128,8 @@ async def update_admin_project(
     introduction = payload.get("introduction")
     # FIX352.2.10 / FIX352.3.{2,3,4}: editable slug list.
     slugs = payload.get("slugs")  # list of {label, is_official, is_active} or None
+    # FIX352.2.14: list of shared property ids, or None to skip.
+    shared_data = payload.get("shared_data")
     # FIX352.2.7 <project-title>: optional decorative label + style.
     # `null` clears the optional ones (size, colour); use empty
     # string to clear title_long_text / title_short_text. Each is
@@ -2351,6 +2366,36 @@ async def update_admin_project(
                         "(project_id, label, is_official, is_active, sort_order) "
                         "values (%s, %s, %s, %s, %s)",
                         (project_id, label, is_official, is_active, i),
+                    )
+            # FIX352.2.14 <project-shared-data>: replace the list.
+            if shared_data is not None:
+                if not isinstance(shared_data, list):
+                    raise HTTPException(status_code=400, detail="shared_data must be a list")
+                ids: list[int] = []
+                for x in shared_data:
+                    try:
+                        pid = int(x)
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=400, detail="invalid shared_data id")
+                    if pid not in ids:
+                        ids.append(pid)
+                if ids:
+                    cur.execute(
+                        "select count(*) as n from shared_property where id = any(%s)",
+                        (ids,),
+                    )
+                    if cur.fetchone()["n"] != len(ids):
+                        raise HTTPException(status_code=400, detail="unknown shared property")
+                cur.execute(
+                    "delete from project_shared_data where project_id = %s",
+                    (project_id,),
+                )
+                for i, pid in enumerate(ids):
+                    cur.execute(
+                        "insert into project_shared_data "
+                        "(project_id, kind, property_id, sort_order) "
+                        "values (%s, 'property', %s, %s)",
+                        (project_id, pid, i),
                     )
         conn.commit()
     return {"ok": True}
@@ -2724,6 +2769,16 @@ def _shared_value_taken(cur, property_id: int, value: str, exclude_id=None) -> b
         (property_id, value, exclude_id),
     )
     return cur.fetchone() is not None
+
+
+# FIX352.2.14: names only, for the <project-shared-data> selector —
+# open to any signed-in user since project editors need not be admin.
+@app.get("/api/shared-data/properties")
+def list_shared_properties(_user=Depends(current_user_required)):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id, name from shared_property order by sort_order, id")
+            return [{"id": r["id"], "name": r["name"]} for r in cur.fetchall()]
 
 
 @app.get("/api/admin/shared-data")
